@@ -46,9 +46,29 @@ def _visible_challenge(frame) -> bool:
             and box["x"] + box["width"] > 0 and box["y"] + box["height"] > 0)
 
 
-def detect_state(page: Page) -> PageState:
+# reCAPTCHA·hCaptcha·Turnstile은 풀리면 페이지의 숨은 응답 칸에 토큰을 채운다.
+_WIDGETS_SOLVED_JS = """() => {
+  const fields = document.querySelectorAll(
+    'textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"],'
+    + ' input[name="cf-turnstile-response"]');
+  return fields.length > 0 && [...fields].every(f => f.value.trim() !== '');
+}"""
+
+
+def _widgets_solved(page: Page) -> bool:
+    """페이지의 모든 체크박스형 위젯이 풀렸는지(토큰 칸이 하나도 없으면 False)."""
+    try:
+        return bool(page.evaluate(_WIDGETS_SOLVED_JS))
+    except Exception:
+        return False
+
+
+def detect_state(page: Page, ignore_widgets: bool = False) -> PageState:
     """현재 화면 상태를 반환한다. 우선순위: PAYMENT > CAPTCHA > QUEUE > NORMAL.
 
+    보안문자 위젯 iframe은 풀린 뒤에도 화면에 남으므로, 토큰이 채워졌으면 보안문자로 보지 않는다.
+    ignore_widgets=True면 위젯 iframe은 아예 보지 않는다(사람이 통과했다고 알린 화면).
+    글자형 보안문자 문구는 어느 경우에도 확인한다.
     페이지가 이동 중이라 읽기에 실패하면 NORMAL을 반환한다.
     """
     try:
@@ -57,7 +77,10 @@ def detect_state(page: Page) -> PageState:
         if any(PAYMENT_URL_MARKERS.search(u) for u in urls):
             return PageState.PAYMENT
         text = page.inner_text("body", timeout=1000).lower()
-        if CAPTCHA_MARKERS.search(text) or any(_visible_challenge(f) for f in frames):
+        if CAPTCHA_MARKERS.search(text):
+            return PageState.CAPTCHA
+        if (not ignore_widgets and any(_visible_challenge(f) for f in frames)
+                and not _widgets_solved(page)):
             return PageState.CAPTCHA
         if QUEUE_MARKERS.search(text):
             return PageState.QUEUE

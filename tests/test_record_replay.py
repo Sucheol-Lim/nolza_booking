@@ -42,11 +42,11 @@ class _Watcher(FakePrompter):
                                 page.input_value("#name")))
         return super().confirm(title, body)
 
-    def wait_until(self, title, body, done, poll_s=0.5):
+    def wait_until(self, title, body, done, poll_s=0.5, manual_ok=None):
         page = self._ref["player"].page
         if "captcha.html" in page.url:
             self.captcha_waits.append(page.input_value("#captcha"))
-        return super().wait_until(title, body, done, poll_s)
+        return super().wait_until(title, body, done, poll_s, manual_ok=manual_ok)
 
 
 def test_record_then_replay_confirms_before_submit(_browser, site_url, tmp_path):

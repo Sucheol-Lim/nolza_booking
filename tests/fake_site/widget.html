@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>예약 정보</title></head>
+<body>
+<h1>예약 정보 입력</h1>
+<label>이름 <input id="name"></label>
+<div id="widget"></div>
+<button id="submit" onclick="location.href='done.html'">예약하기</button>
+<script>
+  // 체크박스형 위젯 흉내: 풀린 뒤에도 iframe은 화면에 남는다.
+  // kind=recaptcha(기본) | hcaptcha | turnstile | unknown(토큰 칸 없음)
+  const kind = new URLSearchParams(location.search).get('kind') || 'recaptcha';
+  const src = {recaptcha: 'recaptcha/api2/anchor', hcaptcha: 'hcaptcha.com/checkbox',
+               turnstile: 'challenges.cloudflare.com/turnstile', unknown: 'recaptcha/enterprise/anchor'}[kind];
+  const token = {recaptcha: '<textarea name="g-recaptcha-response" style="display:none"></textarea>',
+                 hcaptcha: '<textarea name="h-captcha-response" style="display:none"></textarea>',
+                 turnstile: '<input type="hidden" name="cf-turnstile-response">',
+                 unknown: ''}[kind];
+  document.getElementById('widget').innerHTML =
+    `<iframe src="done.html?f=${src}" style="width:304px;height:78px;border:0"></iframe>${token}`;
+</script>
+</body>
+</html>

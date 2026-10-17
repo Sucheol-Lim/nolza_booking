@@ -9,7 +9,12 @@ class Prompter(Protocol):
     def choose(self, title: str, options: list[str]) -> int | None: ...
 
     def wait_until(self, title: str, body: str, done: Callable[[], bool],
-                   poll_s: float = 0.5) -> bool: ...
+                   poll_s: float = 0.5, manual_ok: str | None = None) -> bool:
+        """done()이 True가 되면 True, 중단하면 False.
+
+        manual_ok가 주어지면 사람이 Enter로 "끝났다"고 알릴 수 있고, 그때도 True를 반환한다.
+        """
+        ...
 
 
 class TkPrompter:
@@ -66,10 +71,21 @@ class TkPrompter:
         return result["value"]
 
     def wait_until(self, title: str, body: str, done: Callable[[], bool],
-                   poll_s: float = 0.5) -> bool:
+                   poll_s: float = 0.5, manual_ok: str | None = None) -> bool:
         result = {"value": False}
-        root = self._window(title, body, "완료되면 자동으로 닫힙니다    Esc = 중단")
+        hint = "완료되면 자동으로 닫힙니다    Esc = 중단"
+        if manual_ok:
+            hint = f"완료되면 자동으로 닫힙니다    Enter = {manual_ok}    Esc = 중단"
+        root = self._window(title, body, hint)
         poll_ms = max(1, int(poll_s * 1000))
+
+        if manual_ok:
+            def signal(_e):
+                result["value"] = True
+                root.destroy()
+
+            root.bind("<Return>", signal)
+            root.bind("<KP_Enter>", signal)
 
         def poll():
             try:
@@ -97,10 +113,13 @@ class FakePrompter:
 
     def __init__(self, confirms: list[bool] | None = None,
                  choices: list[int | None] | None = None,
-                 on_wait: Callable[[], None] | None = None):
+                 on_wait: Callable[[], None] | None = None,
+                 manual_waits: list[bool] | None = None):
         self._confirms = list(confirms or [])
         self._choices = list(choices or [])
         self._on_wait = on_wait
+        # manual_ok를 제공한 wait_until 호출마다 하나씩 꺼내 True면 사람이 Enter를 누른 것으로 본다.
+        self._manual_waits = list(manual_waits or [])
         self.calls: list[tuple[str, str]] = []
 
     def confirm(self, title: str, body: str) -> bool:
@@ -112,12 +131,14 @@ class FakePrompter:
         return self._choices.pop(0) if self._choices else None
 
     def wait_until(self, title: str, body: str, done: Callable[[], bool],
-                   poll_s: float = 0.5) -> bool:
+                   poll_s: float = 0.5, manual_ok: str | None = None) -> bool:
         self.calls.append(("wait_until", body))
         start = time.monotonic()
         last_hook = start
         if self._on_wait:
             self._on_wait()
+        if manual_ok and self._manual_waits and self._manual_waits.pop(0):
+            return True
         while True:
             if done():
                 return True

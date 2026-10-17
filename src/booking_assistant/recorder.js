@@ -23,20 +23,14 @@
 
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-  // 보안문자 화면(detect.py와 같은 기준)에서는 입력·클릭을 기록하지 않는다.
+  // 글자형 보안문자 화면(detect.py와 같은 기준)에서는 입력·클릭을 기록하지 않는다.
+  // 체크박스형 위젯(reCAPTCHA·hCaptcha·Turnstile)은 iframe 안이라 원래 기록되지 않으므로,
+  // 위젯이 있다는 이유로 같은 화면의 예약 입력까지 버리지 않는다.
   const CAPTCHA_TEXT = /보안문자|자동입력 ?방지|로봇이 아닙니다|(?<![a-z])captcha(?![a-z])/i;
-  const CAPTCHA_FRAME = /recaptcha|hcaptcha|turnstile/i;
   const onCaptchaPage = () => {
     if (/captcha|turnstile/i.test(location.href)) return true;
     try {
       if (CAPTCHA_TEXT.test(document.body ? document.body.innerText : '')) return true;
-      for (const f of document.querySelectorAll('iframe')) {
-        const src = f.src || '';
-        if (!CAPTCHA_FRAME.test(src) || /size=invisible/i.test(src)) continue;
-        const r = f.getBoundingClientRect();
-        if (r.width > 50 && r.height > 50 && r.bottom > 0 && r.right > 0
-            && getComputedStyle(f).visibility !== 'hidden') return true;
-      }
     } catch (e) {}
     return false;
   };

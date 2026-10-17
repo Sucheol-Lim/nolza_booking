@@ -93,3 +93,11 @@ def test_tk_wait_until_survives_done_error(monkeypatch):
 
     assert TkPrompter().wait_until("t", "b", done, poll_s=0.01) is True
     assert root.destroyed
+
+
+def test_fake_wait_until_manual_signal_only_when_offered():
+    p = FakePrompter(manual_waits=[True, True])
+    assert p.wait_until("t", "b", lambda: False, poll_s=0.01, manual_ok="통과했어요") is True
+    p2 = FakePrompter(manual_waits=[True])
+    p2.WAIT_TOTAL_S = 0.05
+    assert p2.wait_until("t", "b", lambda: False, poll_s=0.01) is False     # 제공 안 했으면 무시

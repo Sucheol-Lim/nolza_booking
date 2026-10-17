@@ -70,3 +70,44 @@ def test_detect_body_read_has_short_timeout(monkeypatch, browser_page, site_url)
     monkeypatch.setattr(browser_page, "inner_text", spy)
     detect_state(browser_page)
     assert seen.get("timeout") == 1000
+
+
+# --- 풀린 뒤에도 화면에 남는 체크박스형 위젯 ---
+
+def _solve_widget(page):
+    page.evaluate("document.querySelector('[name$=\"-response\"]').value = 'token'")
+
+
+@pytest.mark.parametrize("kind", ["recaptcha", "hcaptcha", "turnstile"])
+def test_widget_unsolved_is_captcha(browser_page, site_url, kind):
+    browser_page.goto(f"{site_url}/widget.html?kind={kind}")
+    assert detect_state(browser_page) is PageState.CAPTCHA
+
+
+@pytest.mark.parametrize("kind", ["recaptcha", "hcaptcha", "turnstile"])
+def test_widget_solved_but_still_visible_is_normal(browser_page, site_url, kind):
+    browser_page.goto(f"{site_url}/widget.html?kind={kind}")
+    _solve_widget(browser_page)
+    assert detect_state(browser_page) is PageState.NORMAL
+
+
+def test_widget_token_cleared_again_is_captcha(browser_page, site_url):
+    browser_page.goto(f"{site_url}/widget.html")
+    _solve_widget(browser_page)
+    browser_page.evaluate("document.querySelector('[name=\"g-recaptcha-response\"]').value = ''")
+    assert detect_state(browser_page) is PageState.CAPTCHA       # 토큰 만료
+
+
+def test_one_of_two_widgets_solved_is_still_captcha(browser_page, site_url):
+    browser_page.goto(f"{site_url}/widget.html")
+    browser_page.evaluate("""document.body.insertAdjacentHTML('beforeend',
+        '<textarea name="g-recaptcha-response" style="display:none"></textarea>')""")
+    _solve_widget(browser_page)                                   # 첫 번째만 채움
+    assert detect_state(browser_page) is PageState.CAPTCHA
+
+
+def test_ignore_widgets_keeps_text_captcha(browser_page, site_url):
+    browser_page.goto(f"{site_url}/widget.html?kind=unknown")
+    assert detect_state(browser_page, ignore_widgets=True) is PageState.NORMAL
+    browser_page.goto(f"{site_url}/captcha.html")
+    assert detect_state(browser_page, ignore_widgets=True) is PageState.CAPTCHA

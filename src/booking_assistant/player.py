@@ -100,6 +100,7 @@ class Player:
         self._manual: list[Step] = []      # 사람이 직접 처리한 단계
         self._candidates: list[dict[str, str]] = []
         self._final: Target | None = None    # 녹화의 최종 제출 대상: 그 밖의 단계에서는 절대 누르지 않는다
+        self._widget_ok_url: str | None = None   # 사람이 보안문자 위젯 통과를 알린 화면
         for page in context.pages:
             self._watch(page)
         context.on("page", self._on_new_page)
@@ -126,6 +127,7 @@ class Player:
         steps = rec.apply(values)
         self._final = _final_target(steps)
         self._queue_alerted = False
+        self._widget_ok_url = None
         self._manual = []
         self._candidates = list(opts.candidates)
         used = list(rec.variables) + [s.var for s in rec.steps if s.var and s.var not in rec.variables]
@@ -265,7 +267,7 @@ class Player:
         """대기열·보안문자·결제 화면을 처리한다. (결과, 기다린 적 있는지)."""
         waited = False
         while True:
-            state = detect_state(self.page)
+            state = self._state()
             if state is PageState.QUEUE:
                 self._wait_queue()
             elif state is PageState.CAPTCHA:
@@ -284,19 +286,37 @@ class Player:
             self._queue_alerted = True
             self.alerter.alert(self.page, "대기열 진입", "대기열에 들어왔습니다. 자동으로 기다립니다.")
         poll_ms = max(1, int(self.queue_poll_s * 1000))
-        while detect_state(self.page) is PageState.QUEUE:
+        while self._state() is PageState.QUEUE:
             self.page.wait_for_timeout(poll_ms)
         self.log.event("queue_done", "대기열 통과", self.page)
 
+    def _state(self) -> PageState:
+        """현재 화면 상태. 사람이 위젯 통과를 알린 화면에서는 위젯 iframe을 보지 않는다."""
+        waived = (self._widget_ok_url is not None and self.page is not None
+                  and self.page.url == self._widget_ok_url)
+        return detect_state(self.page, ignore_widgets=waived)
+
     def _captcha_handoff(self) -> bool:
         self.log.event("captcha", "보안문자 화면 — 사람에게 넘깁니다", self.page)
-        self.alerter.alert(self.page, "보안문자 입력 필요", "보안문자를 직접 입력해 주세요.")
-        self._focus_captcha_input()
-        return self.prompter.wait_until(
-            "보안문자 입력 필요",
-            "브라우저에서 보안문자를 직접 입력해 주세요. 통과하면 자동으로 이어갑니다.",
-            done=lambda: detect_state(self.page) is not PageState.CAPTCHA,
+        # 체크박스형 위젯(reCAPTCHA·hCaptcha·Turnstile)만 남은 화면인지: 풀려도 iframe이 남을 수 있어
+        # 토큰을 못 읽는 위젯이면 사람이 Enter로 통과를 알릴 수 있게 한다. 글자형 보안문자는 해당 없음.
+        widget_only = detect_state(self.page, ignore_widgets=True) is not PageState.CAPTCHA
+        self.alerter.alert(self.page, "보안문자 입력 필요", "보안문자를 직접 풀어 주세요.")
+        if widget_only:
+            body = ("브라우저에서 보안문자를 직접 풀어 주세요. 통과하면 자동으로 이어갑니다.\n"
+                    "통과했는데 이 창이 닫히지 않으면 Enter를 눌러 주세요.")
+        else:
+            self._focus_captcha_input()
+            body = "브라우저에서 보안문자를 직접 입력해 주세요. 통과하면 자동으로 이어갑니다."
+        ok = self.prompter.wait_until(
+            "보안문자 입력 필요", body,
+            done=lambda: self._state() is not PageState.CAPTCHA,
+            manual_ok="통과했어요" if widget_only else None,
         )
+        if ok and widget_only and self._state() is PageState.CAPTCHA:
+            self._widget_ok_url = self.page.url
+            self.log.event("captcha_widget_passed", "사람이 보안문자 위젯 통과를 알림", self.page)
+        return ok
 
     def _focus_captcha_input(self) -> None:
         """사람이 바로 입력하도록 보안문자 입력칸에 커서를 둔다(검색창 등 다른 입력칸보다 우선)."""
@@ -603,7 +623,7 @@ class Player:
             self.page.wait_for_load_state("domcontentloaded", timeout=int(AFTER_SUBMIT_WAIT_S * 1000))
         except Exception:
             pass
-        if detect_state(self.page) is PageState.PAYMENT:
+        if self._state() is PageState.PAYMENT:
             return self._hand_to_payment()
         self.log.event("submitted", "최종 제출 완료", self.page)
         return RunResult.SUBMITTED
@@ -643,7 +663,7 @@ class Player:
             self.page.wait_for_load_state("domcontentloaded", timeout=int(AFTER_SUBMIT_WAIT_S * 1000))
         except Exception:
             pass
-        if detect_state(self.page) is PageState.PAYMENT:
+        if self._state() is PageState.PAYMENT:
             return self._hand_to_payment()
         if self.prompter.confirm("직접 제출 확인",
                                  "화면이 바뀌었습니다. 예약을 브라우저에서 직접 제출하셨나요?\n"

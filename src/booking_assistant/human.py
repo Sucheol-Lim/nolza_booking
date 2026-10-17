@@ -72,7 +72,11 @@ class TkPrompter:
         poll_ms = max(1, int(poll_s * 1000))
 
         def poll():
-            if done():
+            try:
+                finished = done()
+            except Exception:    # 화면 이동 중 읽기 실패 등: 아직 안 끝난 것으로 보고 계속 확인한다
+                finished = False
+            if finished:
                 result["value"] = True
                 root.destroy()
             else:

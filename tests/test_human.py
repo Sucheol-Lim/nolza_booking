@@ -61,3 +61,35 @@ def test_solve_captcha_helper_counts(browser_page, site_url):
     browser_page.goto(f"{site_url}/captcha.html")
     solve_captcha(browser_page, "abc")
     assert solve_captcha.count == 1
+
+
+class _FakeRoot:
+    """tkinter 창 대신: after 콜백을 mainloop에서 차례로 실행한다."""
+
+    def __init__(self):
+        self.pending, self.destroyed = [], False
+
+    def bind(self, *a): pass
+    def protocol(self, *a): pass
+    def after(self, ms, fn): self.pending.append(fn)
+    def destroy(self): self.destroyed = True
+
+    def mainloop(self):
+        while self.pending and not self.destroyed:
+            self.pending.pop(0)()
+
+
+def test_tk_wait_until_survives_done_error(monkeypatch):
+    from booking_assistant.human import TkPrompter
+    root = _FakeRoot()
+    monkeypatch.setattr(TkPrompter, "_window", lambda self, *a: root)
+    calls = iter([RuntimeError("페이지 이동 중"), False, True])
+
+    def done():
+        v = next(calls)
+        if isinstance(v, Exception):
+            raise v
+        return v
+
+    assert TkPrompter().wait_until("t", "b", done, poll_s=0.01) is True
+    assert root.destroyed

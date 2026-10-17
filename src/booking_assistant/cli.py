@@ -21,8 +21,13 @@ CHROME_GUIDANCE = ("전용 Chrome에 연결하지 못했습니다. 먼저 `booki
 
 
 def parse_candidate(s: str) -> dict[str, str]:
-    pairs = (item.split("=", 1) for item in s.split(",") if item.strip())
-    return {k.strip(): v.strip() for k, v in pairs}
+    values = {}
+    for item in (i for i in s.split(",") if i.strip()):
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--candidate는 k=v,k=v 형식이어야 합니다: {s}")
+        values[key.strip()] = value.strip()
+    return values
 
 
 def _parse_set(items: list[str]) -> dict[str, str]:
@@ -111,6 +116,7 @@ def _cmd_run(args) -> int:
     rec = load_recording(path)
     try:
         values = _parse_set(args.set)
+        candidates = [parse_candidate(c) for c in args.candidate]
         start_at = datetime.strptime(args.at, "%Y-%m-%d %H:%M:%S") if args.at else None
     except ValueError as e:
         print(f"옵션 형식이 올바르지 않습니다: {e}")
@@ -133,8 +139,7 @@ def _cmd_run(args) -> int:
         player = Player(context, TkPrompter(), Alerter(telegram),
                         RunLog(DEFAULT_HOME / "runs" / stamp),
                         advisor=_make_advisor(config.advisor_model))
-        result = player.run(rec, RunOptions(
-            values, [parse_candidate(c) for c in args.candidate], start_at))
+        result = player.run(rec, RunOptions(values, candidates, start_at))
     finally:
         pw.stop()
     messages = {

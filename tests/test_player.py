@@ -45,6 +45,7 @@ def test_happy_path_submits(context, site_url, tmp_path):
     assert p.calls[-1][0] == "confirm"
     assert "김철수" in p.calls[-1][1]
     assert "무통장입금" in p.calls[-1][1]
+    assert "누를 버튼: 예약하기" in p.calls[-1][1]
     assert [c[0] for c in p.calls] == ["wait_until", "confirm"]   # 보안문자 1회 + 최종 확인뿐
 
 

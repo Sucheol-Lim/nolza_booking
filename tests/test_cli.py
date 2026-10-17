@@ -149,3 +149,12 @@ def test_record_command_saves_yaml_with_var(tmp_path, monkeypatch, capsys):
     assert saved.steps[0].var == "date"
     recorder.start.assert_called_once_with("http://x/")
     pw.stop.assert_called_once()
+
+
+def test_run_malformed_candidate_exits_1_before_connecting(tmp_path, capsys, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    connect = Mock()
+    monkeypatch.setattr("booking_assistant.cli.connect", connect)
+    assert main(["run", "demo", "--set", "date=2026-11-01", "--candidate", "date"]) == 1
+    assert "--candidate" in capsys.readouterr().out
+    connect.assert_not_called()

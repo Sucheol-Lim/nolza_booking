@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,6 +10,7 @@ from enum import Enum
 from time import sleep
 
 from playwright.sync_api import BrowserContext, Locator, Page
+from playwright.sync_api import Error as PlaywrightError
 
 from booking_assistant.advisor import Advisor, Proposal, apply_proposal, simplify_dom
 from booking_assistant.detect import PageState, detect_state, is_captcha_url
@@ -28,7 +30,10 @@ FIND_SLICE_MS = 300           # 상태를 다시 확인하기 전 한 번에 찾
 AFTER_SUBMIT_WAIT_S = 3.0     # 최종 제출 후 이동/팝업을 기다리는 시간
 MAX_PROPOSALS = 3             # 한 단계에서 화면 해석 제안을 받는 최대 횟수(이후 사람 호출)
 APPLY_TIMEOUT_MS = 5000       # 승인된 제안을 적용할 때 요소를 기다리는 시간
+ACTION_TIMEOUT_MS = 5000      # 찾은 요소를 누르거나 입력할 때 기다리는 최대 시간
+MAX_ACTION_TRIES = 2          # 동작 오류(요소가 막 다시 그려짐 등) 때 다시 시도하는 횟수(이후 사람)
 MAX_CHOICES = 9               # 대안 선택 창에 보여 줄 최대 항목 수
+_CAPTCHA_LABEL = re.compile(r"보안문자|자동입력|captcha", re.IGNORECASE)
 
 _CHECKED_LABELS_JS = """
 () => Array.from(document.querySelectorAll('input[type=radio]:checked')).map(el => {
@@ -200,6 +205,7 @@ class Player:
             return None
 
         proposals = 0
+        failures = 0
         while True:
             found = self._locate(step)
             if isinstance(found, RunResult):
@@ -207,12 +213,22 @@ class Player:
             unavailable = found is not None and self._is_choice(step) and not _available(found)
             if found is not None and not unavailable:
                 if step.kind == "final_submit":
-                    return self._final_submit(found)
+                    result = self._final_submit(found)
+                    if result is not None:
+                        return result
+                    continue      # 사람이 아직 제출하지 않음: 버튼을 다시 찾아 다시 승인을 받는다
                 try:
                     self._perform(step, found)
                 except _FinalGuard:
                     self.log.event("final_guard",
                                    f"최종 제출 버튼으로 보여 누르지 않음: {_describe(step.target)}", self.page)
+                except PlaywrightError as e:
+                    failures += 1
+                    self.log.event("action_failed",
+                                   f"{_describe(step.target)}: {type(e).__name__}", self.page)
+                    if failures < MAX_ACTION_TRIES:
+                        continue
+                    return self._on_action_failed(step)
                 else:
                     self.log.event(step.kind, _describe(step.target))
                     return None
@@ -231,6 +247,11 @@ class Player:
             handled = self._on_target_missing(step, following, unavailable)
             if handled is None:
                 return RunResult.ABORTED
+            if step.kind == "final_submit" and handled == _MOVED:
+                # 사람이 브라우저에서 직접 제출했을 수 있다.
+                result = self._after_manual_submit()
+                if result is not None:
+                    return result
             # 대상이 나타났으면 직접 수행한다. 최종 제출은 사람이 대신 처리한 것으로 치지 않고
             # 버튼이 보일 때까지 다시 찾아 승인을 받는다.
             if handled == _OWN_VISIBLE or step.kind == "final_submit":
@@ -270,15 +291,27 @@ class Player:
     def _captcha_handoff(self) -> bool:
         self.log.event("captcha", "보안문자 화면 — 사람에게 넘깁니다", self.page)
         self.alerter.alert(self.page, "보안문자 입력 필요", "보안문자를 직접 입력해 주세요.")
-        try:
-            self.page.locator("input:visible").first.focus(timeout=1000)
-        except Exception:
-            pass
+        self._focus_captcha_input()
         return self.prompter.wait_until(
             "보안문자 입력 필요",
             "브라우저에서 보안문자를 직접 입력해 주세요. 통과하면 자동으로 이어갑니다.",
             done=lambda: detect_state(self.page) is not PageState.CAPTCHA,
         )
+
+    def _focus_captcha_input(self) -> None:
+        """사람이 바로 입력하도록 보안문자 입력칸에 커서를 둔다(검색창 등 다른 입력칸보다 우선)."""
+        candidates = [
+            self.page.get_by_label(_CAPTCHA_LABEL),
+            self.page.locator("input[id*=captcha i]:visible, input[name*=captcha i]:visible"),
+            self.page.locator("input:visible"),
+        ]
+        for loc in candidates:
+            try:
+                if loc.count():
+                    loc.first.focus(timeout=1000)
+                    return
+            except Exception:
+                continue
 
     def _hand_to_payment(self) -> RunResult:
         self.log.event("payment", "결제 화면 — 사람에게 넘깁니다", self.page)
@@ -362,13 +395,13 @@ class Player:
         if self._is_final_element(loc):      # 최종 제출 보호: _find가 걸러도 한 번 더 확인한다
             raise _FinalGuard()
         if step.kind == "fill":
-            loc.fill(step.value or "")
+            loc.fill(step.value or "", timeout=ACTION_TIMEOUT_MS)
         elif step.kind == "select":
-            loc.select_option(step.value)
+            loc.select_option(step.value, timeout=ACTION_TIMEOUT_MS)
         elif _is_check_input(loc):
-            loc.check()
+            loc.check(timeout=ACTION_TIMEOUT_MS)
         else:
-            loc.click()
+            loc.click(timeout=ACTION_TIMEOUT_MS)
 
     # --- 마감 대안과 화면 해석 ---------------------------------------------
 
@@ -515,6 +548,25 @@ class Player:
         self.log.event("missing_handled", f"{desc}: {outcome['v']}", self.page)
         return outcome["v"]
 
+    def _on_action_failed(self, step: Step) -> str | RunResult:
+        """찾은 대상을 자동으로 조작하지 못함(가려짐·막 사라짐 등): 사람이 직접 처리하고 승인한다.
+
+        바뀌지 않는 화면에서는 끝났는지 알 수 없으므로 기다리지 않고 승인으로 받는다."""
+        desc = _describe(step.target)
+        self.alerter.alert(self.page, "직접 처리 필요",
+                           f"'{desc}'을(를) 자동으로 처리하지 못했습니다. 직접 처리해 주세요.")
+        start_page, start_url = self.page, self.page.url
+        if not self.prompter.confirm(
+                "직접 처리 확인",
+                f"'{desc}' {_KIND_KO.get(step.kind, step.kind)}을(를) 자동으로 하지 못했습니다.\n"
+                "브라우저에서 직접 처리한 뒤 승인하면 다음 단계로 이어갑니다. (Esc = 중단)"):
+            self.log.event("aborted", f"직접 처리 거절: {desc}", self.page)
+            return RunResult.ABORTED
+        self._manual.append(step)
+        moved = self.page is not start_page or self.page.url != start_url
+        self.log.event("missing_handled", f"{desc}: 직접 처리", self.page)
+        return _MOVED if moved else _NEXT_VISIBLE
+
     # --- 최종 제출 --------------------------------------------------------
 
     def _summary(self) -> list[str]:
@@ -525,19 +577,23 @@ class Player:
             lines.append("직접 처리한 단계: " + ", ".join(_describe_step(s) for s in self._manual))
         return lines
 
-    def _final_submit(self, loc: Locator) -> RunResult:
+    def _final_submit(self, loc: Locator) -> RunResult | None:
+        """승인을 받고 최종 제출 버튼을 누른다. None이면 아직 제출되지 않음(다시 찾아 승인)."""
         lines = self._summary()
         try:
             lines += [f"선택: {label}" for label in self.page.evaluate(_CHECKED_LABELS_JS)]
         except Exception:
             pass
+        button = _element_text(loc) or _describe(self._final)
+        lines.append(f"누를 버튼: {button}")
         self.log.event("confirm", "최종 제출 확인 요청", self.page)
         if not self.prompter.confirm("최종 제출 확인", "\n".join(lines)):
             self.log.event("aborted", "최종 제출 거절", self.page)
             return RunResult.ABORTED
 
         before_page, before_url = self.page, self.page.url
-        loc.click()
+        if not self._click_final(loc):
+            return self._final_click_failed()
         deadline = time.monotonic() + AFTER_SUBMIT_WAIT_S
         while time.monotonic() < deadline:
             if self.page is not before_page or before_page.url != before_url:
@@ -551,6 +607,58 @@ class Player:
             return self._hand_to_payment()
         self.log.event("submitted", "최종 제출 완료", self.page)
         return RunResult.SUBMITTED
+
+    def _click_final(self, loc: Locator) -> bool:
+        """승인받은 최종 제출 버튼을 누른다. 실패하면 버튼을 다시 찾아 한 번 더 누른다."""
+        for attempt in range(MAX_ACTION_TRIES):
+            try:
+                loc.click(timeout=ACTION_TIMEOUT_MS)
+                return True
+            except PlaywrightError as e:
+                self.log.event("action_failed", f"최종 제출 클릭 실패: {type(e).__name__}", self.page)
+            if attempt + 1 < MAX_ACTION_TRIES:
+                again = self._find(self._final, FIND_SLICE_MS, final_ok=True) if self._final else None
+                if again is None:
+                    return False
+                loc = again
+        return False
+
+    def _final_click_failed(self) -> RunResult | None:
+        """최종 제출 버튼을 누르지 못함: 사람이 직접 누르도록 알리고 화면이 바뀔 때까지 기다린다."""
+        msg = "최종 제출 버튼을 누르지 못했습니다. 브라우저에서 직접 눌러 주세요."
+        self.alerter.alert(self.page, "최종 제출 실패", msg)
+        start_page, start_url = self.page, self.page.url
+        if not self.prompter.wait_until(
+                "최종 제출 실패", msg + " 화면이 바뀌면 이어갑니다.",
+                done=lambda: self.page is not start_page or self.page.url != start_url):
+            self.log.event("aborted", "최종 제출 실패 후 중단", self.page)
+            return RunResult.ABORTED
+        return self._after_manual_submit()
+
+    def _after_manual_submit(self) -> RunResult | None:
+        """최종 제출 단계에서 사람이 화면을 넘김: 결제 화면이면 넘기고, 아니면 직접 제출했는지 묻는다.
+
+        None이면 아직 제출하지 않음(계속 진행)."""
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=int(AFTER_SUBMIT_WAIT_S * 1000))
+        except Exception:
+            pass
+        if detect_state(self.page) is PageState.PAYMENT:
+            return self._hand_to_payment()
+        if self.prompter.confirm("직접 제출 확인",
+                                 "화면이 바뀌었습니다. 예약을 브라우저에서 직접 제출하셨나요?\n"
+                                 "승인 = 제출함(종료)    Esc = 아직 안 함(계속)"):
+            self.log.event("submitted", "사람이 직접 최종 제출함", self.page)
+            return RunResult.SUBMITTED
+        self.log.event("manual_submit_denied", "직접 제출하지 않음 — 계속 진행", self.page)
+        return None
+
+
+def _element_text(loc: Locator) -> str:
+    try:
+        return normalize_text(loc.inner_text(timeout=1000) or loc.get_attribute("value") or "")
+    except Exception:
+        return ""
 
 
 def _css_string(s: str) -> str:

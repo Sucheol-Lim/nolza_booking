@@ -24,7 +24,7 @@
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
   // 보안문자 화면(detect.py와 같은 기준)에서는 입력·클릭을 기록하지 않는다.
-  const CAPTCHA_TEXT = /보안문자|자동입력 ?방지|로봇이 아닙니다|\bcaptcha\b/i;
+  const CAPTCHA_TEXT = /보안문자|자동입력 ?방지|로봇이 아닙니다|(?<![a-z])captcha(?![a-z])/i;
   const CAPTCHA_FRAME = /recaptcha|hcaptcha|turnstile/i;
   const onCaptchaPage = () => {
     if (/captcha|turnstile/i.test(location.href)) return true;

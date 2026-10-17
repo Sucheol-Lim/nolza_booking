@@ -17,6 +17,25 @@
 
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
+  // 보안문자 화면(detect.py와 같은 기준)에서는 입력·클릭을 기록하지 않는다.
+  const CAPTCHA_TEXT = /보안문자|자동입력 ?방지|로봇이 아닙니다|\bcaptcha\b/i;
+  const CAPTCHA_FRAME = /recaptcha|hcaptcha|turnstile/i;
+  const onCaptchaPage = () => {
+    if (/captcha|turnstile/i.test(location.href)) return true;
+    try {
+      if (CAPTCHA_TEXT.test(document.body ? document.body.innerText : '')) return true;
+      for (const f of document.querySelectorAll('iframe')) {
+        const src = f.src || '';
+        if (!CAPTCHA_FRAME.test(src) || /size=invisible/i.test(src)) continue;
+        const r = f.getBoundingClientRect();
+        if (r.width > 50 && r.height > 50 && r.bottom > 0 && r.right > 0
+            && getComputedStyle(f).visibility !== 'hidden') return true;
+      }
+    } catch (e) {}
+    return false;
+  };
+  const record = (ev) => { if (!onCaptchaPage()) send(ev); };
+
   const roleOf = (el) => {
     const r = el.getAttribute('role');
     if (r) return r;
@@ -130,7 +149,7 @@
     if (tag === 'input' && TEXT_TYPES.includes((el.type || '').toLowerCase())) return;
     // 라벨 클릭은 연결된 컨트롤의 합성 click이 기록하므로 중복을 피한다.
     if (tag === 'label' && el.control) return;
-    send({ type: 'click', target: describe(el), url: location.href });
+    record({ type: 'click', target: describe(el), url: location.href });
   }, true);
 
   window.addEventListener('input', (e) => {
@@ -140,14 +159,19 @@
     if (tag === 'select') return;
     if (tag === 'input' && ['radio', 'checkbox'].includes(el.type)) return;
     if (tag !== 'input' && tag !== 'textarea' && !el.isContentEditable) return;
-    send({ type: 'input', target: describe(el), value: el.value, url: location.href });
+    record({ type: 'input', target: describe(el), value: el.value, url: location.href });
   }, true);
 
   window.addEventListener('change', (e) => {
     const el = e.target;
     if (!el || el.nodeType !== 1 || isSensitive(el) || el.tagName !== 'SELECT') return;
-    send({ type: 'change', target: describe(el), value: el.value, url: location.href });
+    record({ type: 'change', target: describe(el), value: el.value, url: location.href });
   }, true);
 
-  if (!location.href.startsWith('about:')) send({ type: 'nav', url: location.href });
+  if (!location.href.startsWith('about:')) {
+    // 문서가 다 그려진 뒤에야 보안문자 문구를 볼 수 있다.
+    const nav = () => record({ type: 'nav', url: location.href });
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', nav);
+    else nav();
+  }
 })();

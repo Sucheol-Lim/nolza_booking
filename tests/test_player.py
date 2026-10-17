@@ -174,3 +174,38 @@ def test_missing_target_that_appears_is_performed_by_player(context, site_url, t
     summary = p.calls[-1][1]
     assert "직접 처리한 단계" not in summary
     assert "time=23:00" in summary
+
+
+def test_recorded_captcha_steps_are_never_replayed(context, site_url, tmp_path):
+    # 예전 녹화에 보안문자 입력이 남아 있어도 재생기는 넣지 않고 건너뛴다(사람이 푼다).
+    rec = make_recording(site_url)
+    cap = f"{site_url}/captcha.html"
+    rec.steps[3:3] = [
+        Step("fill", Target(name="자동입력 방지 문자", css=["#captcha"]), value="ABCD", url=cap),
+        Step("click", Target(role="button", name="확인", text="확인", css=["#captcha-ok"]), url=cap),
+    ]
+    seen, holder = [], {}
+
+    def on_wait():
+        page = holder["player"].page
+        if "captcha.html" in page.url:
+            seen.append(page.input_value("#captcha"))
+            solve_captcha(page, "ABCD")
+
+    p = FakePrompter(confirms=[True], on_wait=on_wait)
+    p.WAIT_TOTAL_S = 5
+    player = holder["player"] = Player(context, p, Mock(), RunLog(tmp_path), queue_poll_s=0.1)
+    assert player.run(rec, OPTS) is RunResult.SUBMITTED
+    assert [c[0] for c in p.calls] == ["wait_until", "confirm"]
+    assert seen[0] == "" and solve_captcha.count == 1
+
+
+def test_leading_goto_to_start_url_not_loaded_twice(context, site_url, tmp_path):
+    navs = []
+    context.on("request", lambda r: navs.append(r.url) if r.is_navigation_request() else None)
+    rec = make_recording(site_url)
+    rec.steps.insert(0, Step("goto", url=rec.start_url))
+    p, holder = captcha_prompter([True])
+    player = holder["player"] = Player(context, p, Mock(), RunLog(tmp_path), queue_poll_s=0.1)
+    assert player.run(rec, OPTS) is RunResult.SUBMITTED
+    assert sum("index.html" in u for u in navs) == 1

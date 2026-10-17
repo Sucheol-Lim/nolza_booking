@@ -11,12 +11,12 @@ from time import sleep
 from playwright.sync_api import BrowserContext, Locator, Page
 
 from booking_assistant.advisor import Advisor, Proposal, apply_proposal, simplify_dom
-from booking_assistant.detect import PageState, detect_state
+from booking_assistant.detect import PageState, detect_state, is_captcha_url
 from booking_assistant.human import Prompter
 from booking_assistant.locate import (find, is_available, is_positional, matches_identity,
                                       normalize_text, resembles)
 from booking_assistant.notify import Alerter
-from booking_assistant.recording import Recording, Step, Target
+from booking_assistant.recording import Recording, Step, Target, same_page_url
 from booking_assistant.runlog import RunLog
 
 _OWN_VISIBLE = "own_visible"     # 못 찾던 대상이 나타남 → 재생기가 직접 수행
@@ -137,6 +137,9 @@ class Player:
 
         url_before: dict[int, str] = {}    # 단계를 수행하기 직전 페이지 URL
         i = 0
+        if steps and steps[0].kind == "goto" and (same_page_url(steps[0].url, rec.start_url)
+                                                  or same_page_url(steps[0].url, self.page.url)):
+            i = 1      # 시작 화면은 방금 열었다: 다시 열면 대기 순번을 잃을 수 있다
         while i < len(steps):
             following = steps[i + 1] if i + 1 < len(steps) else None
             url_before[i] = self.page.url
@@ -185,6 +188,10 @@ class Player:
                   recorded: Step) -> RunResult | _Choice | str | None:
         """단계 하나. RunResult면 종료, _Choice면 사람이 마감 대안을 고름, _MOVED면 사람이 화면을
         넘김, 그 밖에는 다음 단계로. recorded는 변수 치환 전 녹화 단계."""
+        if step.kind != "goto" and is_captcha_url(step.url):
+            # 보안문자는 재생기가 절대 입력하지 않는다: 사람이 풀도록 _settle이 넘긴다.
+            self.log.event("captcha_step_skipped", f"보안문자 화면 단계는 건너뜀: {_describe(step.target)}")
+            return None
         if step.kind == "goto":
             result = self._settle()[0]
             if result is not None:

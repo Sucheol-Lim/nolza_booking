@@ -15,9 +15,15 @@ class PageState(Enum):
 CAPTCHA_MARKERS = re.compile(r"보안문자|자동입력 방지|자동입력방지|captcha|로봇이 아닙니다")
 CAPTCHA_FRAME_MARKERS = re.compile(r"recaptcha|hcaptcha|turnstile")
 QUEUE_MARKERS = re.compile(r"대기순번|대기 순번|접속 대기|대기 중입니다|waiting room|queue")
+CAPTCHA_URL_MARKERS = re.compile(r"captcha|turnstile", re.IGNORECASE)
 PAYMENT_URL_MARKERS = re.compile(
     r"inicis|kcp|tosspayments|nicepay|kakaopay|naverpay|payco|danal|kginicis"
 )
+
+
+def is_captcha_url(url: str | None) -> bool:
+    """보안문자 화면 주소로 보이는지(녹화·재생 모두 이 화면의 입력을 다루지 않는다)."""
+    return bool(url) and bool(CAPTCHA_URL_MARKERS.search(url))
 
 
 def detect_state(page: Page) -> PageState:

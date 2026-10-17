@@ -62,6 +62,14 @@ class Recording:
         return steps
 
 
+def same_page_url(a: str | None, b: str | None) -> bool:
+    """주소가 같은 화면을 가리키는지(끝의 '/'와 '#...' 차이는 무시)."""
+    if not a or not b:
+        return False
+    norm = lambda u: u.split("#", 1)[0].rstrip("/")  # noqa: E731
+    return norm(a) == norm(b)
+
+
 def save_recording(rec: Recording, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

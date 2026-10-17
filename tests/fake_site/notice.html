@@ -3,5 +3,5 @@
 <body>
 <h1>예매 안내</h1>
 <p>예매 전 유의사항을 확인해 주세요.</p>
-<button type="button" onclick="location.href='info.html'">확인</button>
+<button type="button" onclick="location.href=new URLSearchParams(location.search).get('next') || 'info.html'">확인</button>
 </body></html>

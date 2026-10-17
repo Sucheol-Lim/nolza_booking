@@ -136,11 +136,15 @@ class Player:
                 steps, i = self._apply_choice(rec, values, steps, i, outcome, url_before)
                 continue
             if outcome == _MOVED:
-                # 사람이 다른 화면으로 넘어갔다: 대상이 보이는 첫 남은 단계부터 이어간다.
-                resume = self._resync(steps, i + 1)
+                # 사람이 다른 화면으로 넘어갔다: 현재 단계부터 대상이 보이는 첫 단계에서 이어간다.
+                resume = self._resync(steps, i)
                 if isinstance(resume, RunResult):
                     return resume
-                self._manual += steps[i + 1:resume]
+                if resume == i:
+                    # 현재 단계 대상이 새 화면에 있다(예: 끼어든 안내 화면을 사람이 넘김) — 직접 수행한다.
+                    self._manual = [m for m in self._manual if m is not steps[i]]
+                else:
+                    self._manual += steps[i + 1:resume]
                 i = resume
                 continue
             i += 1
@@ -185,12 +189,13 @@ class Player:
             if found is not None and not unavailable:
                 break
             if self._is_choice(step):
-                # 고를 값이 없거나 마감: 사람이 대안을 고른다(대안이 없으면 아래에서 사람 호출).
+                # 고를 값이 없거나 마감: 사람이 대안을 고른다. 대안이 없으면 마감이면 사람 호출,
+                # 대상을 못 찾았으면(낯선 화면일 수 있음) 아래 화면 해석으로 넘어간다.
                 choice = self._offer_alternatives(step, recorded, found)
                 if choice is not None:
                     return choice
-            elif (self.advisor is not None and step.kind != "final_submit"
-                  and proposals < MAX_PROPOSALS):
+            if (not unavailable and self.advisor is not None and step.kind != "final_submit"
+                    and proposals < MAX_PROPOSALS):
                 # 최종 제출 버튼은 해석 제안으로 누르지 않는다(최종 확인을 거쳐야 함).
                 proposals += 1
                 if self._apply_advice(step):

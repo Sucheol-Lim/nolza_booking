@@ -39,6 +39,26 @@ def _captcha_or_notice(ref):
     return on_wait
 
 
+class _NameAtConfirm(FakePrompter):
+    """confirm마다 info 화면의 #name 값을 기록한다(실제로 채워졌는지 확인용)."""
+    def __init__(self, ref, **kw):
+        super().__init__(**kw)
+        self._ref = ref
+        self.names = []
+
+    def confirm(self, title, body):
+        page = self._ref["player"].page
+        if "info.html" in page.url:
+            self.names.append(page.input_value("#name"))
+        return super().confirm(title, body)
+
+
+def _assert_name_filled(p):
+    assert p.names[-1] == "김철수"                     # 최종 확인 시점에 이름이 실제로 채워짐
+    assert "name=김철수" in p.calls[-1][1]
+    assert "직접 처리한 단계" not in p.calls[-1][1]
+
+
 def _captcha_only(ref):
     def on_wait():
         page = ref["player"].page
@@ -70,11 +90,12 @@ def test_unknown_notice_screen_with_advisor(context, site_url, tmp_path):
 def test_advisor_rejected_falls_back_to_human(context, site_url, tmp_path):
     ref = {}
     advisor = _click_notice_advisor()
-    p = FakePrompter(confirms=[False, True], on_wait=_captcha_or_notice(ref))
+    p = _NameAtConfirm(ref, confirms=[False, True], on_wait=_captcha_or_notice(ref))
     player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), advisor=advisor,
                                     queue_poll_s=0.1)
     assert player.run(make_recording(site_url, start=NOTICE_START), OPTS) is RunResult.SUBMITTED
     assert [c[0] for c in p.calls] == ["wait_until", "confirm", "wait_until", "confirm"]
+    _assert_name_filled(p)
     assert "예약 완료" in player.page.inner_text("body")
 
 
@@ -83,25 +104,44 @@ def test_stale_proposal_falls_back_to_human(monkeypatch, context, site_url, tmp_
     ref = {}
     advisor = Mock()
     advisor.propose.return_value = Proposal("click", 999, None, "사라진 요소")   # 화면에 없는 ba_id
-    p = FakePrompter(confirms=[True, True], on_wait=_captcha_or_notice(ref))
+    p = _NameAtConfirm(ref, confirms=[True, True], on_wait=_captcha_or_notice(ref))
     player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), advisor=advisor,
                                     queue_poll_s=0.1)
     assert player.run(make_recording(site_url, start=NOTICE_START), OPTS) is RunResult.SUBMITTED
     assert [c[0] for c in p.calls] == ["wait_until", "confirm", "wait_until", "confirm"]
     assert advisor.propose.call_count == 1
+    _assert_name_filled(p)
 
 
 def test_advisor_gives_up_after_three_proposals(context, site_url, tmp_path):
     ref = {}
     advisor = Mock()
     advisor.propose.return_value = Proposal("wait", None, None, "잠시 기다림")   # 화면이 안 바뀜
-    p = FakePrompter(confirms=[True, True, True, True], on_wait=_captcha_or_notice(ref))
+    p = _NameAtConfirm(ref, confirms=[True, True, True, True], on_wait=_captcha_or_notice(ref))
     player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), advisor=advisor,
                                     queue_poll_s=0.1)
     assert player.run(make_recording(site_url, start=NOTICE_START), OPTS) is RunResult.SUBMITTED
     assert advisor.propose.call_count == 3
     assert [c[0] for c in p.calls] == ["wait_until", "confirm", "confirm", "confirm",
                                        "wait_until", "confirm"]
+    _assert_name_filled(p)
+
+
+def test_choice_step_on_unknown_screen_asks_advisor(context, site_url, tmp_path):
+    # 날짜 단계 앞에 안내 화면이 끼어듦: 날짜를 못 찾고 대안도 없으면 화면 해석으로 넘어간다.
+    ref = {}
+    advisor = _click_notice_advisor()
+    p = FakePrompter(confirms=[True, True], on_wait=_captcha_only(ref))
+    player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), advisor=advisor,
+                                    queue_poll_s=0.1)
+    rec = make_recording(site_url, start="notice.html?next=index.html")
+    assert player.run(rec, OPTS) is RunResult.SUBMITTED
+    assert [c[0] for c in p.calls] == ["confirm", "wait_until", "confirm"]
+    assert advisor.propose.call_count == 1
+    assert "2026-11-03" in advisor.propose.call_args.kwargs["goal"]
+    assert "date=2026-11-03" in p.calls[-1][1]
+    assert "직접 처리한 단계" not in p.calls[-1][1]
+    assert "예약 완료" in player.page.inner_text("body")
 
 
 def _soldout_run(context, site_url, tmp_path, values, candidates, choices, confirms=(True,)):

@@ -117,3 +117,58 @@ def test_start_at_waits(monkeypatch, context, site_url, tmp_path):
     assert player.run(make_recording(site_url), opts) is RunResult.SUBMITTED
     assert 4.5 <= sum(slept) <= 5.0
     assert sum("index.html" in u for u in navs) == 1
+
+
+def _index_or_captcha(player_ref, on_index):
+    """보안문자 화면이면 정답을 넣고, index 화면이면 on_index(page)를 부르는 on_wait."""
+    def on_wait():
+        page = player_ref["player"].page
+        if "captcha.html" in page.url:
+            solve_captcha(page, "ABCD")
+        elif "index.html" in page.url:
+            on_index(page)
+    return on_wait
+
+
+def test_missing_target_waits_for_human_and_flags_summary(context, site_url, tmp_path):
+    ref, index_calls = {}, []
+
+    def on_index(page):
+        index_calls.append(page.url)
+        if len(index_calls) >= 2:          # 첫 호출엔 아무것도 하지 않는다(즉시 완료되면 안 됨)
+            page.click("text=19:00")
+            page.click("#next")
+
+    p = FakePrompter(confirms=[True], on_wait=_index_or_captcha(ref, on_index))
+    player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), queue_poll_s=0.1)
+    opts = RunOptions(values={**OPTS.values, "time": "23:00"})
+    assert player.run(make_recording(site_url), opts) is RunResult.SUBMITTED
+    assert len(index_calls) >= 2
+    summary = p.calls[-1][1]
+    assert "직접 처리한 단계" in summary
+    assert "time=(직접 선택됨" in summary
+    assert "23:00" not in summary
+    assert "name=김철수" in summary
+    assert "예약 완료" in player.page.inner_text("body")
+
+
+def test_missing_target_that_appears_is_performed_by_player(context, site_url, tmp_path):
+    ref = {}
+
+    def inject(page):
+        page.evaluate("""() => {
+          if (document.getElementById('late')) return;
+          const b = document.createElement('button');
+          b.id = 'late'; b.type = 'button'; b.textContent = '23:00';
+          b.onclick = () => sessionStorage.setItem('late-clicked', '1');
+          document.getElementById('times').appendChild(b);
+        }""")
+
+    p = FakePrompter(confirms=[True], on_wait=_index_or_captcha(ref, inject))
+    player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), queue_poll_s=0.1)
+    opts = RunOptions(values={**OPTS.values, "time": "23:00"})
+    assert player.run(make_recording(site_url), opts) is RunResult.SUBMITTED
+    assert player.page.evaluate("sessionStorage.getItem('late-clicked')") == "1"
+    summary = p.calls[-1][1]
+    assert "직접 처리한 단계" not in summary
+    assert "time=23:00" in summary

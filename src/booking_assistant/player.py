@@ -17,7 +17,11 @@ from booking_assistant.notify import Alerter
 from booking_assistant.recording import Recording, Step, Target
 from booking_assistant.runlog import RunLog
 
-FIND_TIMEOUT_S = 3.0          # 정상 화면에서 대상을 기다리는 시간(대기열·보안문자 시간 제외)
+_OWN_VISIBLE = "own_visible"     # 못 찾던 대상이 나타남 → 재생기가 직접 수행
+_NEXT_VISIBLE = "next_visible"   # 다음 단계 대상이 새로 나타남 → 사람이 처리함
+_MOVED = "moved"                 # 화면(URL/페이지)이 바뀜 → 사람이 처리함
+
+FIND_TIMEOUT_S = 3.0         # 정상 화면에서 대상을 기다리는 시간(대기열·보안문자 시간 제외)
 FIND_SLICE_MS = 300           # 상태를 다시 확인하기 전 한 번에 찾는 시간
 AFTER_SUBMIT_WAIT_S = 3.0     # 최종 제출 후 이동/팝업을 기다리는 시간
 
@@ -53,6 +57,8 @@ class Player:
         self.queue_poll_s = queue_poll_s
         self.page: Page | None = None
         self._queue_alerted = False
+        self._values: dict[str, str] = {}
+        self._manual: list[Step] = []      # 사람이 직접 처리한 단계
         for page in context.pages:
             self._watch(page)
         context.on("page", self._on_new_page)
@@ -76,6 +82,10 @@ class Player:
 
     def run(self, rec: Recording, opts: RunOptions) -> RunResult:
         steps = rec.apply(opts.values)
+        self._queue_alerted = False
+        self._manual = []
+        used = list(rec.variables) + [s.var for s in rec.steps if s.var and s.var not in rec.variables]
+        self._values = {name: opts.values[name] for name in used if name in opts.values}
         if opts.start_at is not None:
             delay = (opts.start_at - datetime.now(opts.start_at.tzinfo)).total_seconds()
             if delay > 0:
@@ -86,17 +96,26 @@ class Player:
         self.page.goto(rec.start_url)
         self.log.event("start", f"재생 시작: {rec.name}", self.page)
 
-        summary = self._summary(rec, opts)
-        for i, step in enumerate(steps):
+        i = 0
+        while i < len(steps):
             following = steps[i + 1] if i + 1 < len(steps) else None
-            result = self._run_step(step, following, summary)
-            if result is not None:
-                return result
+            outcome = self._run_step(steps[i], following)
+            if isinstance(outcome, RunResult):
+                return outcome
+            if outcome == _MOVED:
+                # 사람이 다른 화면으로 넘어갔다: 대상이 보이는 첫 남은 단계부터 이어간다.
+                resume = self._resync(steps, i + 1)
+                if isinstance(resume, RunResult):
+                    return resume
+                self._manual += steps[i + 1:resume]
+                i = resume
+                continue
+            i += 1
         self.log.event("aborted", "녹화에 최종 제출 단계가 없습니다", self.page)
         return RunResult.ABORTED
 
-    def _run_step(self, step: Step, following: Step | None,
-                  summary_lines: list[str]) -> RunResult | None:
+    def _run_step(self, step: Step, following: Step | None) -> RunResult | str | None:
+        """단계 하나. RunResult면 종료, _MOVED면 사람이 화면을 넘김, 그 밖에는 다음 단계로."""
         if step.kind == "goto":
             result = self._settle()[0]
             if result is not None:
@@ -110,14 +129,18 @@ class Player:
                 return found
             if found is not None:
                 break
-            # 마지막 단계는 사람이 대상을 보이게 해 주면 승인을 받아 직접 누른다.
-            if not self._on_target_missing(step, following or step):
+            handled = self._on_target_missing(step, following)
+            if handled is None:
                 return RunResult.ABORTED
-            if step.kind != "final_submit":
-                return None
+            # 대상이 나타났으면 직접 수행한다. 최종 제출은 사람이 대신 처리한 것으로 치지 않고
+            # 버튼이 보일 때까지 다시 찾아 승인을 받는다.
+            if handled == _OWN_VISIBLE or step.kind == "final_submit":
+                continue
+            self._manual.append(step)
+            return handled
 
         if step.kind == "final_submit":
-            return self._final_submit(found, summary_lines)
+            return self._final_submit(found)
         self._perform(step, found)
         self.log.event(step.kind, _describe(step.target))
         return None
@@ -179,11 +202,31 @@ class Player:
                 return result
             if waited:
                 deadline = time.monotonic() + FIND_TIMEOUT_S
-            found = find(self.page, target, timeout_ms=FIND_SLICE_MS) or self._label_of_hidden_input(target)
+            found = self._find(target, FIND_SLICE_MS)
             if found is not None:
                 return found
             if time.monotonic() >= deadline:
                 return None
+
+    def _find(self, target: Target, timeout_ms: int) -> Locator | None:
+        return find(self.page, target, timeout_ms=timeout_ms) or self._label_of_hidden_input(target)
+
+    def _resync(self, steps: list[Step], start: int) -> int | RunResult:
+        """start 이후 대상이 보이는 첫 단계의 위치. 못 찾으면 start(그 단계에서 다시 사람 호출)."""
+        deadline = time.monotonic() + FIND_TIMEOUT_S
+        while True:
+            result, waited = self._settle()
+            if result is not None:
+                return result
+            if waited:
+                deadline = time.monotonic() + FIND_TIMEOUT_S
+            for k in range(start, len(steps)):
+                target = steps[k].target
+                if steps[k].kind == "goto" or (target is not None and self._find(target, 0) is not None):
+                    return k
+            if time.monotonic() >= deadline:
+                return start
+            self.page.wait_for_timeout(FIND_SLICE_MS)
 
     def _label_of_hidden_input(self, target: Target) -> Locator | None:
         """숨겨진 라디오/체크박스는 연결된 라벨을 대신 누른다."""
@@ -214,32 +257,51 @@ class Player:
         else:
             loc.click()
 
-    def _on_target_missing(self, step: Step, following: Step) -> bool:
-        """대상을 못 찾음. True면 사람이 처리했으니 진행한다. (Task 9에서 advisor로 확장)"""
+    def _on_target_missing(self, step: Step, following: Step | None) -> str | None:
+        """대상을 못 찾아 사람에게 넘긴다. (Task 9에서 advisor로 확장)
+
+        _MOVED / _OWN_VISIBLE / _NEXT_VISIBLE 중 하나, 중단이면 None.
+        다음 단계 대상은 기다리기 시작할 때 안 보이다가 새로 보여야만 처리 완료로 본다.
+        """
         desc = _describe(step.target)
         self.log.event("missing", f"대상을 찾지 못함: {desc}", self.page)
         self.alerter.alert(self.page, "화면 확인 필요", f"'{desc}'을(를) 찾지 못했습니다. 직접 처리해 주세요.")
-        start_url = self.page.url
+        start_page, start_url = self.page, self.page.url
+        next_target = following.target if following is not None else None
+        next_was_visible = next_target is not None and self._find(next_target, 0) is not None
+        outcome: dict[str, str] = {}
 
         def done() -> bool:
-            if self.page.url != start_url:
-                return True
-            return following.target is not None and find(self.page, following.target, timeout_ms=0) is not None
+            if self.page is not start_page or self.page.url != start_url:
+                outcome["v"] = _MOVED
+            elif step.target is not None and self._find(step.target, 0) is not None:
+                outcome["v"] = _OWN_VISIBLE
+            elif (next_target is not None and not next_was_visible
+                  and self._find(next_target, 0) is not None):
+                outcome["v"] = _NEXT_VISIBLE
+            return "v" in outcome
 
-        return self.prompter.wait_until(
+        if not self.prompter.wait_until(
             "화면 확인 필요",
             f"'{desc}'을(를) 찾지 못했습니다. 브라우저에서 직접 처리해 주시면 이어갑니다.",
             done=done,
-        )
+        ):
+            return None
+        self.log.event("missing_handled", f"{desc}: {outcome['v']}", self.page)
+        return outcome["v"]
 
     # --- 최종 제출 --------------------------------------------------------
 
-    def _summary(self, rec: Recording, opts: RunOptions) -> list[str]:
-        used = list(rec.variables) + [s.var for s in rec.steps if s.var and s.var not in rec.variables]
-        return [f"{name}: {opts.values[name]}" for name in used if name in opts.values]
+    def _summary(self) -> list[str]:
+        manual_vars = {s.var for s in self._manual if s.var}
+        lines = [f"{name}=(직접 선택됨 — 화면에서 확인하세요)" if name in manual_vars
+                 else f"{name}={value}" for name, value in self._values.items()]
+        if self._manual:
+            lines.append("직접 처리한 단계: " + ", ".join(_describe_step(s) for s in self._manual))
+        return lines
 
-    def _final_submit(self, loc: Locator, summary_lines: list[str]) -> RunResult:
-        lines = list(summary_lines)
+    def _final_submit(self, loc: Locator) -> RunResult:
+        lines = self._summary()
         try:
             lines += [f"선택: {label}" for label in self.page.evaluate(_CHECKED_LABELS_JS)]
         except Exception:
@@ -272,6 +334,11 @@ def _is_check_input(loc: Locator) -> bool:
             "el => el.tagName === 'INPUT' && ['radio','checkbox'].includes(el.type)"))
     except Exception:
         return False
+
+
+def _describe_step(step: Step) -> str:
+    # 변수 단계는 의도한 값이 화면과 다를 수 있으니 값 대신 변수 이름으로 적는다.
+    return f"{step.var} 선택" if step.var else _describe(step.target)
 
 
 def _describe(target: Target | None) -> str:

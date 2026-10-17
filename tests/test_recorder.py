@@ -82,3 +82,40 @@ def test_leading_goto_to_start_url_dropped():
     assert [s.kind for s in events_to_steps(ev, start_url="http://x/a")] == ["goto", "click"]
     assert events_to_steps(ev, start_url="http://x/a")[0].url == "http://x/b"
     assert [s.kind for s in events_to_steps(ev)] == ["goto", "goto", "click"]
+
+
+# --- C3: 결제 화면과 카드 정보 입력칸은 녹화하지 않는다 ---
+
+CARD = "4111111111111111"
+
+
+def test_payment_page_plain_input_not_recorded(context, site_url):
+    r = Recorder(context); page = r.start(site_url + "/pay.html?pg=inicis")
+    page.evaluate("document.body.insertAdjacentHTML('beforeend','<input type=text id=num>')")
+    page.fill("#num", CARD); page.click("#num")
+    page.close()                                 # 결제 화면에서는 단축키도 받지 않는다
+    steps = r.wait_finished()
+    assert all(s.value != CARD for s in steps)
+    assert not any(s.url and "pay.html" in s.url for s in steps)
+
+
+def test_card_like_fields_not_recorded(context, site_url):
+    r = Recorder(context); page = r.start(site_url + "/info.html")
+    page.evaluate("""document.body.insertAdjacentHTML('beforeend',
+        '<input type=text name=cardNo><input type=text id=cvc><input type=text id=user-pin>')""")
+    page.fill("[name=cardNo]", CARD); page.fill("#cvc", "123"); page.fill("#user-pin", "0000")
+    page.fill("#name", "홍길동"); page.keyboard.press("Control+Shift+S")
+    values = [s.value for s in r.wait_finished()]
+    assert CARD not in values and "123" not in values and "0000" not in values
+    assert "홍길동" in values
+
+
+def test_events_from_payment_url_or_card_field_dropped():
+    r = Recorder(None)
+    r._on_event(None, {"type": "input", "target": {"css": ["#num"]}, "value": CARD,
+                       "url": "https://mobile.inicis.com/pay"})
+    r._on_event(None, {"type": "input", "target": {"css": ['[name="card_no"]']}, "value": CARD,
+                       "url": "http://x/a"})
+    r._on_event(None, {"type": "input", "target": {"css": ["#name"]}, "value": "홍길동",
+                       "url": "http://x/a"})
+    assert [e["value"] for e in r._events] == ["홍길동"]

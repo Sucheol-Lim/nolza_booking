@@ -1,6 +1,8 @@
 (() => {
-  // iframe(결제창 등)은 녹화하지 않는다.
+  // iframe(결제창 등)과 결제사 화면(팝업 포함)은 녹화하지 않는다. 목록은 detect.PAYMENT_URL_MARKERS.
+  const PAYMENT = new RegExp(__BA_PAYMENT_MARKERS__, 'i');
   if (window.top !== window || window.__baRecorderInstalled) return;
+  if (PAYMENT.test(location.href)) return;
   window.__baRecorderInstalled = true;
 
   const send = (ev) => { try { window.__baRecord(ev); } catch (e) {} };
@@ -9,10 +11,14 @@
   let finalMode = false;
   let badge = null;
 
+  // 카드번호·비밀번호·PIN으로 보이는 입력칸(id/name 기준)
+  const SENSITIVE_NAME = /card|cvc|cvv|pwd|passw|(^|[^a-z])pin/i;
+  const sensitiveName = (s) => !!s && (SENSITIVE_NAME.test(s) || /[a-z]Pin/.test(s));
   const isSensitive = (el) => {
     if (!el || el.nodeType !== 1) return false;
     const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-    return (el.tagName === 'INPUT' && el.type === 'password') || ac.startsWith('cc-');
+    return (el.tagName === 'INPUT' && el.type === 'password') || ac.startsWith('cc-')
+      || sensitiveName(el.id) || sensitiveName(el.getAttribute('name'));
   };
 
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();

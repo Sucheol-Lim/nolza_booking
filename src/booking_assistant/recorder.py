@@ -1,17 +1,35 @@
 """사용자의 예약 흐름을 페이지 안 JS로 캡처해 Step 목록으로 만든다."""
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import fields
 from pathlib import Path
 
 from playwright.sync_api import BrowserContext, Page
 
-from booking_assistant.detect import is_captcha_url
+from booking_assistant.detect import PAYMENT_URL_MARKERS, is_captcha_url
 from booking_assistant.recording import Step, Target, same_page_url
 
 BINDING_NAME = "__baRecord"
 _TARGET_FIELDS = {f.name for f in fields(Target)}
 _ACTION_EVENTS = ("click", "input", "change", "nav")
+# recorder.js의 SENSITIVE_NAME과 같은 기준(카드번호·비밀번호·PIN 입력칸의 id/name)
+_SENSITIVE_NAME = re.compile(r"card|cvc|cvv|pwd|passw|(^|[^a-z])pin|[a-z]Pin")
+_ID_OR_NAME = re.compile(r'^#(.+)$|^\[name="(.*)"\]$')
+
+
+def _is_sensitive_target(target: dict | None) -> bool:
+    for css in (target or {}).get("css") or []:
+        m = _ID_OR_NAME.match(css)
+        word = m and (m.group(1) or m.group(2))
+        if word and (_SENSITIVE_NAME.search(word.lower()) or _SENSITIVE_NAME.search(word)):
+            return True
+    return False
+
+
+def _is_payment_url(url: str | None) -> bool:
+    return bool(url) and bool(PAYMENT_URL_MARKERS.search(url.lower()))
 
 
 def _target(data: dict | None) -> Target | None:
@@ -60,6 +78,10 @@ class Recorder:
         if payload.get("type") == "stop":
             self._finished = True
             return
+        if _is_payment_url(payload.get("url")):
+            return      # 결제사 화면은 녹화하지 않는다
+        if payload.get("type") in ("input", "change") and _is_sensitive_target(payload.get("target")):
+            return      # 카드번호 등으로 보이는 입력칸
         if payload.get("type") in _ACTION_EVENTS and (
                 payload.get("captcha") or is_captcha_url(payload.get("url"))):
             return      # 보안문자 화면의 입력·클릭은 녹화하지 않는다(재생 때 사람이 푼다)
@@ -70,7 +92,8 @@ class Recorder:
     def start(self, start_url: str) -> Page:
         # init script는 이후 생성되는 문서에만 적용되므로 등록 후 새 페이지를 연다.
         self._start_url = start_url
-        script = Path(__file__).with_name("recorder.js").read_text(encoding="utf-8")
+        script = Path(__file__).with_name("recorder.js").read_text(encoding="utf-8").replace(
+            "__BA_PAYMENT_MARKERS__", json.dumps(PAYMENT_URL_MARKERS.pattern))
         self.context.expose_binding(BINDING_NAME, self._on_event)
         self.context.add_init_script(script)
         self.context.on("page", lambda p: self._pages.append(p))

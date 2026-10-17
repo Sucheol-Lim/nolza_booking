@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>접속 대기</title></head>
+<body>
+<h1>접속 대기 중입니다</h1>
+<p>현재 대기순번 <span id="n">3</span></p>
+<script>
+  const params = new URLSearchParams(location.search);
+  const wait = parseFloat(params.get('wait') || '0');
+  const next = params.get('next') || 'captcha.html';
+  let n = 3;
+  const tick = setInterval(() => {
+    if (n > 1) { n -= 1; document.getElementById('n').textContent = n; }
+  }, Math.max(200, (wait * 1000) / 3));
+  setTimeout(() => { clearInterval(tick); location.href = next; }, wait * 1000);
+</script>
+</body></html>

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>보안문자</title></head>
+<body>
+<h1>보안문자 확인</h1>
+<label for="captcha">자동입력 방지 문자</label>
+<input id="captcha" type="text" autocomplete="off">
+<button type="button" id="captcha-ok">확인</button>
+<p id="msg" hidden>다시 입력</p>
+<script>
+  const params = new URLSearchParams(location.search);
+  const next = params.get('next') || 'info.html';
+  const input = document.getElementById('captcha');
+  function check() {
+    if (input.value === 'ABCD') { location.href = next; }
+    else { document.getElementById('msg').hidden = false; }
+  }
+  document.getElementById('captcha-ok').addEventListener('click', check);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') check(); });
+</script>
+</body></html>

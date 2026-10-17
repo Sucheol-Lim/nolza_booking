@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>공연 예매</title></head>
+<body>
+<h1>공연 예매</h1>
+<div id="dates">
+  <button type="button" class="date">2026-11-01</button>
+  <button type="button" class="date soldout" disabled>2026-11-02</button>
+  <button type="button" class="date">2026-11-03</button>
+</div>
+<div id="times" hidden>
+  <button type="button" class="time">19:00</button>
+  <button type="button" class="time">21:00 </button>
+</div>
+<button type="button" id="next">다음</button>
+<script>
+  const params = new URLSearchParams(location.search);
+  document.querySelectorAll('.date:not([disabled])').forEach(b =>
+    b.addEventListener('click', () => { document.getElementById('times').hidden = false; }));
+  document.getElementById('next').addEventListener('click', () => {
+    const next = params.get('next');
+    if (params.get('popup') === '1') {
+      window.open('queue.html?wait=0&next=' + encodeURIComponent(next || 'info.html'));
+    } else {
+      location.href = 'queue.html?wait=2' + (next ? '&next=' + encodeURIComponent(next) : '');
+    }
+  });
+</script>
+</body></html>

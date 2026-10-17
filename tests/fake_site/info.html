@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>예약자 정보</title></head>
+<body>
+<h1>예약자 정보</h1>
+<label for="name">이름</label> <input id="name" type="text"><br>
+<label for="phone">연락처</label> <input id="phone" type="text"><br>
+<label><input type="radio" name="pay" value="bank">무통장입금</label>
+<label><input type="radio" name="pay" value="card">신용카드</label><br>
+<button type="button" id="submit">예약하기</button>
+<script>
+  document.getElementById('submit').addEventListener('click', () => {
+    const pay = document.querySelector('input[name=pay]:checked');
+    if (pay && pay.value === 'card') { window.open('pay.html?pg=inicis'); }
+    else { location.href = 'done.html'; }
+  });
+</script>
+</body></html>

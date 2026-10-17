@@ -13,13 +13,13 @@ OPTS = RunOptions(values={"date": "2026-11-03", "time": "19:00",
                           "name": "김철수", "phone": "010-0000-0000"})
 
 
-def make_recording(site_url, pay="무통장입금", start="index.html"):
+def make_recording(site_url, pay="무통장입금", start="index.html", recorded_time="19:00"):
     return Recording(
         name="test",
         start_url=f"{site_url}/{start}",
         steps=[
             Step("click", Target(text="2026-11-01"), var="date"),
-            Step("click", Target(text="19:00"), var="time"),
+            Step("click", Target(text=recorded_time), var="time"),
             Step("click", Target(role="button", name="다음", text="다음", css=["#next"])),
             Step("fill", Target(css=["#name"]), value="홍길동", var="name"),
             Step("fill", Target(css=["#phone"]), value="010-1111-1111", var="phone"),
@@ -142,7 +142,8 @@ def test_missing_target_waits_for_human_and_flags_summary(context, site_url, tmp
     p = FakePrompter(confirms=[True], on_wait=_index_or_captcha(ref, on_index))
     player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), queue_poll_s=0.1)
     opts = RunOptions(values={**OPTS.values, "time": "23:00"})
-    assert player.run(make_recording(site_url), opts) is RunResult.SUBMITTED
+    # 녹화 당시 시간(20:00)도 화면에 없어 대안을 나열할 수 없다 → 사람 호출(마감 대안은 Task 9 테스트)
+    assert player.run(make_recording(site_url, recorded_time="20:00"), opts) is RunResult.SUBMITTED
     assert len(index_calls) >= 2
     summary = p.calls[-1][1]
     assert "직접 처리한 단계" in summary
@@ -167,7 +168,8 @@ def test_missing_target_that_appears_is_performed_by_player(context, site_url, t
     p = FakePrompter(confirms=[True], on_wait=_index_or_captcha(ref, inject))
     player = ref["player"] = Player(context, p, Mock(), RunLog(tmp_path), queue_poll_s=0.1)
     opts = RunOptions(values={**OPTS.values, "time": "23:00"})
-    assert player.run(make_recording(site_url), opts) is RunResult.SUBMITTED
+    # 녹화 당시 시간(20:00)도 화면에 없어 대안을 나열할 수 없다 → 사람 호출(마감 대안은 Task 9 테스트)
+    assert player.run(make_recording(site_url, recorded_time="20:00"), opts) is RunResult.SUBMITTED
     assert player.page.evaluate("sessionStorage.getItem('late-clicked')") == "1"
     summary = p.calls[-1][1]
     assert "직접 처리한 단계" not in summary

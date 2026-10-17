@@ -1,6 +1,7 @@
 """녹화 재생기: 대기열은 기다리고, 보안문자·결제는 사람에게 넘기고, 최종 제출은 승인 후에만 누른다."""
 from __future__ import annotations
 
+import dataclasses
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,10 +10,10 @@ from time import sleep
 
 from playwright.sync_api import BrowserContext, Locator, Page
 
-from booking_assistant.advisor import Advisor
+from booking_assistant.advisor import Advisor, Proposal, apply_proposal, simplify_dom
 from booking_assistant.detect import PageState, detect_state
 from booking_assistant.human import Prompter
-from booking_assistant.locate import find
+from booking_assistant.locate import find, is_available, normalize_text
 from booking_assistant.notify import Alerter
 from booking_assistant.recording import Recording, Step, Target
 from booking_assistant.runlog import RunLog
@@ -24,12 +25,30 @@ _MOVED = "moved"                 # 화면(URL/페이지)이 바뀜 → 사람이
 FIND_TIMEOUT_S = 3.0         # 정상 화면에서 대상을 기다리는 시간(대기열·보안문자 시간 제외)
 FIND_SLICE_MS = 300           # 상태를 다시 확인하기 전 한 번에 찾는 시간
 AFTER_SUBMIT_WAIT_S = 3.0     # 최종 제출 후 이동/팝업을 기다리는 시간
+MAX_PROPOSALS = 3             # 한 단계에서 화면 해석 제안을 받는 최대 횟수(이후 사람 호출)
+APPLY_TIMEOUT_MS = 5000       # 승인된 제안을 적용할 때 요소를 기다리는 시간
+MAX_CHOICES = 9               # 대안 선택 창에 보여 줄 최대 항목 수
 
 _CHECKED_LABELS_JS = """
 () => Array.from(document.querySelectorAll('input[type=radio]:checked')).map(el => {
   const label = (el.labels && el.labels[0]) || el.closest('label');
   return ((label ? label.innerText : el.value) || '').trim();
 }).filter(Boolean)
+"""
+
+# 대상 근처(부모, 조부모)에서 같은 태그의 보이는 요소 텍스트
+_SIBLING_TEXTS_JS = r"""
+(el) => {
+  const tag = el.tagName;
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let box = el.parentElement;
+  for (let depth = 0; box && depth < 2; depth++, box = box.parentElement) {
+    const items = Array.from(box.getElementsByTagName(tag)).filter(visible);
+    if (items.length >= 2)
+      return items.map(e => (e.innerText || e.value || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  }
+  return [];
+}
 """
 
 
@@ -46,6 +65,12 @@ class RunResult(Enum):
     ABORTED = "aborted"
 
 
+@dataclass
+class _Choice:
+    """사람이 고른 마감 대안: 새로 쓸 변수 값들."""
+    values: dict[str, str]
+
+
 class Player:
     def __init__(self, context: BrowserContext, prompter: Prompter, alerter: Alerter,
                  log: RunLog, advisor: Advisor | None = None, queue_poll_s: float = 1.0):
@@ -59,6 +84,7 @@ class Player:
         self._queue_alerted = False
         self._values: dict[str, str] = {}
         self._manual: list[Step] = []      # 사람이 직접 처리한 단계
+        self._candidates: list[dict[str, str]] = []
         for page in context.pages:
             self._watch(page)
         context.on("page", self._on_new_page)
@@ -81,9 +107,11 @@ class Player:
     # --- 실행 ------------------------------------------------------------
 
     def run(self, rec: Recording, opts: RunOptions) -> RunResult:
-        steps = rec.apply(opts.values)
+        values = dict(opts.values)
+        steps = rec.apply(values)
         self._queue_alerted = False
         self._manual = []
+        self._candidates = list(opts.candidates)
         used = list(rec.variables) + [s.var for s in rec.steps if s.var and s.var not in rec.variables]
         self._values = {name: opts.values[name] for name in used if name in opts.values}
         if opts.start_at is not None:
@@ -96,12 +124,17 @@ class Player:
         self.page.goto(rec.start_url)
         self.log.event("start", f"재생 시작: {rec.name}", self.page)
 
+        url_before: dict[int, str] = {}    # 단계를 수행하기 직전 페이지 URL
         i = 0
         while i < len(steps):
             following = steps[i + 1] if i + 1 < len(steps) else None
-            outcome = self._run_step(steps[i], following)
+            url_before[i] = self.page.url
+            outcome = self._run_step(steps[i], following, rec.steps[i])
             if isinstance(outcome, RunResult):
                 return outcome
+            if isinstance(outcome, _Choice):
+                steps, i = self._apply_choice(rec, values, steps, i, outcome, url_before)
+                continue
             if outcome == _MOVED:
                 # 사람이 다른 화면으로 넘어갔다: 대상이 보이는 첫 남은 단계부터 이어간다.
                 resume = self._resync(steps, i + 1)
@@ -114,8 +147,28 @@ class Player:
         self.log.event("aborted", "녹화에 최종 제출 단계가 없습니다", self.page)
         return RunResult.ABORTED
 
-    def _run_step(self, step: Step, following: Step | None) -> RunResult | str | None:
-        """단계 하나. RunResult면 종료, _MOVED면 사람이 화면을 넘김, 그 밖에는 다음 단계로."""
+    def _apply_choice(self, rec: Recording, values: dict[str, str], steps: list[Step], i: int,
+                      choice: _Choice, url_before: dict[int, str]) -> tuple[list[Step], int]:
+        """고른 대안 값을 반영하고, 바뀐 변수가 처음 쓰인 단계부터 다시 진행할 위치를 돌려준다."""
+        changed = {k for k, v in choice.values.items() if values.get(k) != v}
+        values.update(choice.values)
+        self._values.update(choice.values)
+        new_steps = rec.apply(values)
+        j = next((k for k in range(i + 1) if new_steps[k].var in changed), i)
+        # 다시 진행할 단계는 더 이상 사람이 처리한 단계가 아니다. 나머지는 새 단계 목록을 가리키게 한다.
+        self._manual = [new_steps[k] for k in range(j)
+                        if any(m is steps[k] for m in self._manual)]
+        url = url_before.get(j)
+        if j < i and url and url != self.page.url:
+            # 그 단계는 이전 페이지에 있었다: 그 단계 직전 URL로 한 번만 이동한다.
+            self.log.event("rewind", f"{_describe_step(new_steps[j])}부터 다시 진행: {url}", self.page)
+            self.page.goto(url)
+        return new_steps, j
+
+    def _run_step(self, step: Step, following: Step | None,
+                  recorded: Step) -> RunResult | _Choice | str | None:
+        """단계 하나. RunResult면 종료, _Choice면 사람이 마감 대안을 고름, _MOVED면 사람이 화면을
+        넘김, 그 밖에는 다음 단계로. recorded는 변수 치환 전 녹화 단계."""
         if step.kind == "goto":
             result = self._settle()[0]
             if result is not None:
@@ -123,13 +176,26 @@ class Player:
             self.page.goto(step.url)
             return None
 
+        proposals = 0
         while True:
             found = self._locate(step.target)
             if isinstance(found, RunResult):
                 return found
-            if found is not None:
+            unavailable = found is not None and self._is_choice(step) and not _available(found)
+            if found is not None and not unavailable:
                 break
-            handled = self._on_target_missing(step, following)
+            if self._is_choice(step):
+                # 고를 값이 없거나 마감: 사람이 대안을 고른다(대안이 없으면 아래에서 사람 호출).
+                choice = self._offer_alternatives(step, recorded, found)
+                if choice is not None:
+                    return choice
+            elif (self.advisor is not None and step.kind != "final_submit"
+                  and proposals < MAX_PROPOSALS):
+                # 최종 제출 버튼은 해석 제안으로 누르지 않는다(최종 확인을 거쳐야 함).
+                proposals += 1
+                if self._apply_advice(step):
+                    continue
+            handled = self._on_target_missing(step, following, unavailable)
             if handled is None:
                 return RunResult.ABORTED
             # 대상이 나타났으면 직접 수행한다. 최종 제출은 사람이 대신 처리한 것으로 치지 않고
@@ -257,15 +323,108 @@ class Player:
         else:
             loc.click()
 
-    def _on_target_missing(self, step: Step, following: Step | None) -> str | None:
-        """대상을 못 찾아 사람에게 넘긴다. (Task 9에서 advisor로 확장)
+    # --- 마감 대안과 화면 해석 ---------------------------------------------
+
+    @staticmethod
+    def _is_choice(step: Step) -> bool:
+        """값으로 화면 항목을 고르는 단계(날짜·시간 등). 마감이면 사람이 대안을 고른다."""
+        return step.var is not None and step.kind == "click" and step.target is not None
+
+    def _ready(self, step: Step, loc: Locator | None) -> bool:
+        return loc is not None and (not self._is_choice(step) or _available(loc))
+
+    def _value_available(self, step: Step, value: str) -> bool:
+        target = dataclasses.replace(step.target, text=value, name=value, css=[])
+        return self._ready(step, self._find(target, 0))
+
+    def _candidate_label(self, var: str, cand: dict[str, str]) -> str:
+        others = [f"{k}={v}" for k, v in cand.items() if k != var and self._values.get(k) != v]
+        return f"{cand[var]} ({', '.join(others)})" if others else cand[var]
+
+    def _sibling_texts(self, anchor: Locator | None) -> list[str]:
+        if anchor is None:
+            return []
+        try:
+            return [normalize_text(t) for t in anchor.evaluate(_SIBLING_TEXTS_JS)]
+        except Exception:
+            return []
+
+    def _offer_alternatives(self, step: Step, recorded: Step,
+                            found: Locator | None) -> _Choice | RunResult | None:
+        """마감 대안을 사람이 고르게 한다. 스스로 고르지 않는다: 가능한 대안이 하나여도 묻는다.
+
+        _Choice(선택함), RunResult.ABORTED(선택 취소), None(대안 없음 → 사람 호출).
+        """
+        var, current = step.var, step.target.text or ""
+        options: list[tuple[str, dict[str, str]]] = []
+        for cand in self._candidates:
+            value = cand.get(var)
+            if value is None or not self._value_available(step, value):
+                continue
+            label = self._candidate_label(var, cand)
+            if label not in [o[0] for o in options]:
+                options.append((label, dict(cand)))
+        if not options:
+            # 후보가 없으면 마감된 대상(또는 녹화 당시 대상) 근처의 가능한 같은 종류 항목을 보여 준다.
+            anchor = found
+            if anchor is None and recorded.target is not None:
+                anchor = self._find(recorded.target, 0)
+            for text in self._sibling_texts(anchor):
+                if (text != normalize_text(current) and text not in [o[0] for o in options]
+                        and self._value_available(step, text)):
+                    options.append((text, {var: text}))
+        if not options:
+            return None
+        options = options[:MAX_CHOICES]
+
+        self.log.event("soldout", f"{var}={current} 선택 불가 — 대안 {len(options)}개", self.page)
+        self.alerter.alert(self.page, "마감 — 대안 선택 필요",
+                           f"'{current}'을(를) 선택할 수 없습니다. 대안을 골라 주세요.")
+        idx = self.prompter.choose("마감된 항목 대안 선택", [label for label, _ in options])
+        if idx is None or not 0 <= idx < len(options):
+            self.log.event("aborted", "마감 대안 선택 취소", self.page)
+            return RunResult.ABORTED
+        label, values = options[idx]
+        self.log.event("alternative", f"{var}: {label} 선택", self.page)
+        return _Choice(values)
+
+    def _apply_advice(self, step: Step) -> bool:
+        """화면 해석 제안을 사람이 승인하면 적용한다. 적용했으면 True(같은 단계 재시도)."""
+        try:
+            dom = simplify_dom(self.page)
+            shot = self.page.screenshot()
+        except Exception as e:
+            self.log.event("advisor_failed", f"화면 정보 수집 실패: {type(e).__name__}", self.page)
+            return False
+        proposal = self.advisor.propose(goal=_goal(step), screenshot=shot, dom=dom)
+        self.log.event("advisor", f"{proposal.action} {proposal.ba_id}: {proposal.reason}", self.page)
+        if proposal.action == "ask_human":
+            return False
+        self.alerter.alert(self.page, "제안 확인 필요", f"낯선 화면입니다. 제안: {proposal.reason}")
+        if not self.prompter.confirm("이렇게 진행할까요?",
+                                     f"{proposal.reason}\n대상: {_proposal_target(proposal, dom)}"):
+            self.log.event("advisor_rejected", "제안 거절", self.page)
+            return False
+        try:
+            apply_proposal(self.page, proposal, timeout_ms=APPLY_TIMEOUT_MS)
+        except Exception as e:   # 화면이 바뀌어 ba_id가 사라짐 등
+            self.log.event("advisor_failed", f"제안 적용 실패: {type(e).__name__}", self.page)
+            return False
+        return True
+
+    # --- 사람 호출 ---------------------------------------------------------
+
+    def _on_target_missing(self, step: Step, following: Step | None,
+                           unavailable: bool = False) -> str | None:
+        """대상을 못 찾았거나(또는 마감인데 대안이 없어) 사람에게 넘긴다.
 
         _MOVED / _OWN_VISIBLE / _NEXT_VISIBLE 중 하나, 중단이면 None.
         다음 단계 대상은 기다리기 시작할 때 안 보이다가 새로 보여야만 처리 완료로 본다.
         """
         desc = _describe(step.target)
-        self.log.event("missing", f"대상을 찾지 못함: {desc}", self.page)
-        self.alerter.alert(self.page, "화면 확인 필요", f"'{desc}'을(를) 찾지 못했습니다. 직접 처리해 주세요.")
+        problem = "선택할 수 없고 대안도 없습니다" if unavailable else "찾지 못했습니다"
+        self.log.event("missing", f"대상을 {problem}: {desc}", self.page)
+        self.alerter.alert(self.page, "화면 확인 필요", f"'{desc}'을(를) {problem}. 직접 처리해 주세요.")
         start_page, start_url = self.page, self.page.url
         next_target = following.target if following is not None else None
         next_was_visible = next_target is not None and self._find(next_target, 0) is not None
@@ -274,7 +433,7 @@ class Player:
         def done() -> bool:
             if self.page is not start_page or self.page.url != start_url:
                 outcome["v"] = _MOVED
-            elif step.target is not None and self._find(step.target, 0) is not None:
+            elif step.target is not None and self._ready(step, self._find(step.target, 0)):
                 outcome["v"] = _OWN_VISIBLE
             elif (next_target is not None and not next_was_visible
                   and self._find(next_target, 0) is not None):
@@ -283,7 +442,7 @@ class Player:
 
         if not self.prompter.wait_until(
             "화면 확인 필요",
-            f"'{desc}'을(를) 찾지 못했습니다. 브라우저에서 직접 처리해 주시면 이어갑니다.",
+            f"'{desc}'을(를) {problem}. 브라우저에서 직접 처리해 주시면 이어갑니다.",
             done=done,
         ):
             return None
@@ -334,6 +493,40 @@ def _is_check_input(loc: Locator) -> bool:
             "el => el.tagName === 'INPUT' && ['radio','checkbox'].includes(el.type)"))
     except Exception:
         return False
+
+
+def _available(loc: Locator) -> bool:
+    try:
+        return is_available(loc)
+    except Exception:   # 요소가 막 사라짐: 다시 찾을 때 드러난다
+        return True
+
+
+_KIND_KO = {"click": "누르기", "fill": "입력", "select": "선택", "final_submit": "최종 제출"}
+
+
+def _goal(step: Step) -> str:
+    t = step.target or Target()
+    parts = []
+    if t.text:
+        parts.append(f"텍스트 '{t.text}'")
+    elif t.name:
+        parts.append(f"이름 '{t.name}'")
+    if t.css:
+        parts.append("선택자 " + ", ".join(t.css))
+    goal = f"다음 단계: {' / '.join(parts) or '(대상 정보 없음)'} {_KIND_KO.get(step.kind, step.kind)}"
+    if step.value:
+        goal += f" (값: {step.value})"
+    return goal + ". 이 대상이 지금 화면에 없습니다. 이 대상이 나오는 화면으로 넘어가는 동작을 제안하세요."
+
+
+def _proposal_target(p: Proposal, dom: str) -> str:
+    if p.action not in ("click", "fill"):
+        return "(없음 — 잠시 기다림)" if p.action == "wait" else "(없음)"
+    prefix = f"[{p.ba_id}] "
+    line = next((ln[len(prefix):] for ln in dom.splitlines() if ln.startswith(prefix)),
+                f"요소 {p.ba_id}(화면 목록에 없음)")
+    return f"{line} ← '{p.value}' 입력" if p.action == "fill" else line
 
 
 def _describe_step(step: Step) -> str:

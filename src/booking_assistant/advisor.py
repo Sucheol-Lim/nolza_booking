@@ -120,9 +120,12 @@ class Advisor:
         return Proposal(action, ba_id, value, reason)
 
 
-def apply_proposal(page, p: Proposal) -> None:
-    """click/fill 제안을 data-ba-id 요소에 적용한다. 그 외 동작은 아무것도 하지 않는다."""
+def apply_proposal(page, p: Proposal, timeout_ms: float | None = None) -> None:
+    """click/fill 제안을 data-ba-id 요소에 적용한다. 그 외 동작은 아무것도 하지 않는다.
+
+    요소가 사라졌으면(오래된 ba_id) timeout_ms(기본: Playwright 기본값) 후 Playwright 오류를 낸다.
+    """
     if p.action == "click":
-        page.locator(f'[data-ba-id="{p.ba_id}"]').click()
+        page.locator(f'[data-ba-id="{p.ba_id}"]').click(timeout=timeout_ms)
     elif p.action == "fill":
-        page.locator(f'[data-ba-id="{p.ba_id}"]').fill(p.value or "")
+        page.locator(f'[data-ba-id="{p.ba_id}"]').fill(p.value or "", timeout=timeout_ms)

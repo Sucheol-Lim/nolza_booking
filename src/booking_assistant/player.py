@@ -13,7 +13,8 @@ from playwright.sync_api import BrowserContext, Locator, Page
 from booking_assistant.advisor import Advisor, Proposal, apply_proposal, simplify_dom
 from booking_assistant.detect import PageState, detect_state
 from booking_assistant.human import Prompter
-from booking_assistant.locate import find, is_available, normalize_text
+from booking_assistant.locate import (find, is_available, is_positional, matches_identity,
+                                      normalize_text, resembles)
 from booking_assistant.notify import Alerter
 from booking_assistant.recording import Recording, Step, Target
 from booking_assistant.runlog import RunLog
@@ -71,6 +72,14 @@ class _Choice:
     values: dict[str, str]
 
 
+class _FinalGuard(Exception):
+    """최종 제출 버튼으로 보이는 요소를 최종 확인 없이 조작하려 함."""
+
+
+def _final_target(steps: list[Step]) -> Target | None:
+    return next((s.target for s in steps if s.kind == "final_submit"), None)
+
+
 class Player:
     def __init__(self, context: BrowserContext, prompter: Prompter, alerter: Alerter,
                  log: RunLog, advisor: Advisor | None = None, queue_poll_s: float = 1.0):
@@ -85,6 +94,7 @@ class Player:
         self._values: dict[str, str] = {}
         self._manual: list[Step] = []      # 사람이 직접 처리한 단계
         self._candidates: list[dict[str, str]] = []
+        self._final: Target | None = None    # 녹화의 최종 제출 대상: 그 밖의 단계에서는 절대 누르지 않는다
         for page in context.pages:
             self._watch(page)
         context.on("page", self._on_new_page)
@@ -109,6 +119,7 @@ class Player:
     def run(self, rec: Recording, opts: RunOptions) -> RunResult:
         values = dict(opts.values)
         steps = rec.apply(values)
+        self._final = _final_target(steps)
         self._queue_alerted = False
         self._manual = []
         self._candidates = list(opts.candidates)
@@ -158,6 +169,7 @@ class Player:
         values.update(choice.values)
         self._values.update(choice.values)
         new_steps = rec.apply(values)
+        self._final = _final_target(new_steps)
         j = next((k for k in range(i + 1) if new_steps[k].var in changed), i)
         # 다시 진행할 단계는 더 이상 사람이 처리한 단계가 아니다. 나머지는 새 단계 목록을 가리키게 한다.
         self._manual = [new_steps[k] for k in range(j)
@@ -182,19 +194,28 @@ class Player:
 
         proposals = 0
         while True:
-            found = self._locate(step.target)
+            found = self._locate(step)
             if isinstance(found, RunResult):
                 return found
             unavailable = found is not None and self._is_choice(step) and not _available(found)
             if found is not None and not unavailable:
-                break
-            if self._is_choice(step):
+                if step.kind == "final_submit":
+                    return self._final_submit(found)
+                try:
+                    self._perform(step, found)
+                except _FinalGuard:
+                    self.log.event("final_guard",
+                                   f"최종 제출 버튼으로 보여 누르지 않음: {_describe(step.target)}", self.page)
+                else:
+                    self.log.event(step.kind, _describe(step.target))
+                    return None
+            elif self._is_choice(step):
                 # 고를 값이 없거나 마감: 사람이 대안을 고른다. 대안이 없으면 마감이면 사람 호출,
                 # 대상을 못 찾았으면(낯선 화면일 수 있음) 아래 화면 해석으로 넘어간다.
                 choice = self._offer_alternatives(step, recorded, found)
                 if choice is not None:
                     return choice
-            if (not unavailable and self.advisor is not None and step.kind != "final_submit"
+            if (found is None and self.advisor is not None and step.kind != "final_submit"
                     and proposals < MAX_PROPOSALS):
                 # 최종 제출 버튼은 해석 제안으로 누르지 않는다(최종 확인을 거쳐야 함).
                 proposals += 1
@@ -209,12 +230,6 @@ class Player:
                 continue
             self._manual.append(step)
             return handled
-
-        if step.kind == "final_submit":
-            return self._final_submit(found)
-        self._perform(step, found)
-        self.log.event(step.kind, _describe(step.target))
-        return None
 
     # --- 상태 처리 --------------------------------------------------------
 
@@ -265,7 +280,7 @@ class Player:
 
     # --- 대상 찾기와 조작 -------------------------------------------------
 
-    def _locate(self, target: Target) -> Locator | RunResult | None:
+    def _locate(self, step: Step) -> Locator | RunResult | None:
         deadline = time.monotonic() + FIND_TIMEOUT_S
         while True:
             result, waited = self._settle()
@@ -273,14 +288,21 @@ class Player:
                 return result
             if waited:
                 deadline = time.monotonic() + FIND_TIMEOUT_S
-            found = self._find(target, FIND_SLICE_MS)
+            found = self._find(step.target, FIND_SLICE_MS, final_ok=step.kind == "final_submit")
             if found is not None:
                 return found
             if time.monotonic() >= deadline:
                 return None
 
-    def _find(self, target: Target, timeout_ms: int) -> Locator | None:
-        return find(self.page, target, timeout_ms=timeout_ms) or self._label_of_hidden_input(target)
+    def _find(self, target: Target, timeout_ms: int, final_ok: bool = False) -> Locator | None:
+        """대상을 찾는다. final_ok가 아니면 최종 제출 버튼으로 보이는 요소는 찾은 것으로 치지 않는다."""
+        found = find(self.page, target, timeout_ms=timeout_ms) or self._label_of_hidden_input(target)
+        if found is not None and not final_ok and self._is_final_element(found):
+            return None
+        return found
+
+    def _is_final_element(self, loc: Locator) -> bool:
+        return self._final is not None and resembles(loc, self._final)
 
     def _resync(self, steps: list[Step], start: int) -> int | RunResult:
         """start 이후 대상이 보이는 첫 단계의 위치. 못 찾으면 start(그 단계에서 다시 사람 호출)."""
@@ -293,32 +315,45 @@ class Player:
                 deadline = time.monotonic() + FIND_TIMEOUT_S
             for k in range(start, len(steps)):
                 target = steps[k].target
-                if steps[k].kind == "goto" or (target is not None and self._find(target, 0) is not None):
+                if steps[k].kind == "goto" or (target is not None and self._find(
+                        target, 0, final_ok=steps[k].kind == "final_submit") is not None):
                     return k
             if time.monotonic() >= deadline:
                 return start
             self.page.wait_for_timeout(FIND_SLICE_MS)
 
     def _label_of_hidden_input(self, target: Target) -> Locator | None:
-        """숨겨진 라디오/체크박스는 연결된 라벨을 대신 누른다."""
+        """숨겨진 라디오/체크박스는 연결된 라벨을 대신 누른다.
+
+        녹화된 텍스트/이름이 있으면 그와 같은 입력만 받는다(같은 name을 쓰는 다른 선택지를 누르지 않음).
+        위치 기반 선택자는 그 확인이 있을 때만 쓴다."""
+        has_identity = bool(target.text or target.name)
         for selector in target.css:
+            if is_positional(selector) and not has_identity:
+                continue
             try:
-                loc = self.page.locator(selector).first
-                if loc.count() == 0 or loc.evaluate(
-                        "el => el.tagName !== 'INPUT' || !['radio','checkbox'].includes(el.type)"):
-                    continue
-                el_id = loc.get_attribute("id")
-                labels = [loc.locator("xpath=ancestor::label")]
-                if el_id:
-                    labels.insert(0, self.page.locator(f'label[for="{el_id}"]'))
-                for label in labels:
-                    if label.count() and label.first.is_visible():
-                        return label.first
+                matches = self.page.locator(selector)
+                for n in range(matches.count()):
+                    loc = matches.nth(n)
+                    if loc.evaluate(
+                            "el => el.tagName !== 'INPUT' || !['radio','checkbox'].includes(el.type)"):
+                        continue
+                    if has_identity and not matches_identity(loc, target):
+                        continue
+                    el_id = loc.get_attribute("id")
+                    labels = [loc.locator("xpath=ancestor::label")]
+                    if el_id:
+                        labels.insert(0, self.page.locator(f"label[for={_css_string(el_id)}]"))
+                    for label in labels:
+                        if label.count() and label.first.is_visible():
+                            return label.first
             except Exception:
                 continue
         return None
 
     def _perform(self, step: Step, loc: Locator) -> None:
+        if self._is_final_element(loc):      # 최종 제출 보호: _find가 걸러도 한 번 더 확인한다
+            raise _FinalGuard()
         if step.kind == "fill":
             loc.fill(step.value or "")
         elif step.kind == "select":
@@ -405,10 +440,16 @@ class Player:
         self.log.event("advisor", f"{proposal.action} {proposal.ba_id}: {proposal.reason}", self.page)
         if proposal.action == "ask_human":
             return False
+        if self._proposal_hits_final(proposal):
+            self.log.event("final_guard", "제안 대상이 최종 제출 버튼이라 적용하지 않음", self.page)
+            return False
         self.alerter.alert(self.page, "제안 확인 필요", f"낯선 화면입니다. 제안: {proposal.reason}")
         if not self.prompter.confirm("이렇게 진행할까요?",
                                      f"{proposal.reason}\n대상: {_proposal_target(proposal, dom)}"):
             self.log.event("advisor_rejected", "제안 거절", self.page)
+            return False
+        if self._proposal_hits_final(proposal):     # 승인하는 사이 화면이 바뀌었을 수 있다
+            self.log.event("final_guard", "제안 대상이 최종 제출 버튼이라 적용하지 않음", self.page)
             return False
         try:
             apply_proposal(self.page, proposal, timeout_ms=APPLY_TIMEOUT_MS)
@@ -416,6 +457,15 @@ class Player:
             self.log.event("advisor_failed", f"제안 적용 실패: {type(e).__name__}", self.page)
             return False
         return True
+
+    def _proposal_hits_final(self, proposal: Proposal) -> bool:
+        if proposal.action not in ("click", "fill"):
+            return False
+        loc = self.page.locator(f'[data-ba-id="{proposal.ba_id}"]')
+        try:
+            return any(self._is_final_element(loc.nth(n)) for n in range(loc.count()))
+        except Exception:
+            return True     # 확인할 수 없으면 적용하지 않는다
 
     # --- 사람 호출 ---------------------------------------------------------
 
@@ -432,16 +482,20 @@ class Player:
         self.alerter.alert(self.page, "화면 확인 필요", f"'{desc}'을(를) {problem}. 직접 처리해 주세요.")
         start_page, start_url = self.page, self.page.url
         next_target = following.target if following is not None else None
-        next_was_visible = next_target is not None and self._find(next_target, 0) is not None
+        next_final = following is not None and following.kind == "final_submit"
+        own_final = step.kind == "final_submit"
+        next_was_visible = (next_target is not None
+                            and self._find(next_target, 0, final_ok=next_final) is not None)
         outcome: dict[str, str] = {}
 
         def done() -> bool:
             if self.page is not start_page or self.page.url != start_url:
                 outcome["v"] = _MOVED
-            elif step.target is not None and self._ready(step, self._find(step.target, 0)):
+            elif step.target is not None and self._ready(
+                    step, self._find(step.target, 0, final_ok=own_final)):
                 outcome["v"] = _OWN_VISIBLE
             elif (next_target is not None and not next_was_visible
-                  and self._find(next_target, 0) is not None):
+                  and self._find(next_target, 0, final_ok=next_final) is not None):
                 outcome["v"] = _NEXT_VISIBLE
             return "v" in outcome
 
@@ -490,6 +544,10 @@ class Player:
             return self._hand_to_payment()
         self.log.event("submitted", "최종 제출 완료", self.page)
         return RunResult.SUBMITTED
+
+
+def _css_string(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _is_check_input(loc: Locator) -> bool:

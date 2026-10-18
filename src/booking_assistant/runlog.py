@@ -8,6 +8,8 @@ from playwright.sync_api import Page
 
 log = logging.getLogger(__name__)
 
+SCREENSHOT_TIMEOUT_MS = 3000   # 뒤쪽 탭 등에서 멈춰도 기록 때문에 진행을 오래 막지 않는다
+
 
 class RunLog:
     def __init__(self, dir: Path):
@@ -26,7 +28,7 @@ class RunLog:
             self._n += 1
             name = f"{self._n:03d}.png"
             try:
-                page.screenshot(path=str(self.dir / name))
+                page.screenshot(path=str(self.dir / name), timeout=SCREENSHOT_TIMEOUT_MS)
                 shot = name
             except Exception:
                 log.warning("스크린샷 저장 실패", exc_info=True)

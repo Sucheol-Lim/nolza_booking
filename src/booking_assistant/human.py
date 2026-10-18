@@ -2,6 +2,9 @@
 import time
 from typing import Callable, Protocol
 
+TK_RETRIES = 5
+TK_RETRY_DELAY_S = 0.2
+
 
 class Prompter(Protocol):
     def confirm(self, title: str, body: str) -> bool: ...
@@ -23,7 +26,15 @@ class TkPrompter:
     def _window(self, title: str, body: str, hint: str):
         import tkinter as tk
 
-        root = tk.Tk()
+        # Windows에서 가끔 Tcl 초기화 파일을 순간적으로 못 읽어 Tk()가 실패한다: 몇 번 재시도한다.
+        for attempt in range(TK_RETRIES):
+            try:
+                root = tk.Tk()
+                break
+            except tk.TclError:
+                if attempt == TK_RETRIES - 1:
+                    raise
+                time.sleep(TK_RETRY_DELAY_S)
         root.title(title)
         root.attributes("-topmost", True)
         tk.Label(root, text=title, font=("", 13, "bold")).pack(padx=20, pady=(16, 4))
@@ -38,6 +49,21 @@ class TkPrompter:
         root.focus_force()
         return root
 
+    @staticmethod
+    def _buttons(root, buttons: list[tuple[str, Callable[[], None]]], vertical: bool = False) -> None:
+        """클릭용 버튼. Windows는 다른 프로그램이 키보드 포커스를 가져가는 것을 막을 수 있어
+        창이 맨 위에 떠도 Enter가 안 먹을 수 있다 — 그때도 클릭 한 번으로 처리할 수 있게 한다."""
+        import tkinter as tk
+
+        frame = tk.Frame(root)
+        frame.pack(padx=20, pady=(0, 16), fill="x" if vertical else None)
+        for label, action in buttons:
+            btn = tk.Button(frame, text=label, command=action, padx=12, pady=4)
+            if vertical:
+                btn.pack(fill="x", pady=2)
+            else:
+                btn.pack(side="left", padx=4)
+
     def confirm(self, title: str, body: str) -> bool:
         result = {"value": False}
         root = self._window(title, body, "Enter = 승인    Esc = 중단")
@@ -46,6 +72,8 @@ class TkPrompter:
             result["value"] = value
             root.destroy()
 
+        self._buttons(root, [("승인 (Enter)", lambda: finish(True)),
+                             ("중단 (Esc)", lambda: finish(False))])
         root.bind("<Return>", lambda e: finish(True))
         root.bind("<KP_Enter>", lambda e: finish(True))
         root.bind("<Escape>", lambda e: finish(False))
@@ -63,6 +91,9 @@ class TkPrompter:
             result["value"] = i
             root.destroy()
 
+        self._buttons(root, [(f"{i}. {opt}", lambda i=i: pick(i - 1))
+                             for i, opt in enumerate(options, 1)]
+                      + [("중단 (Esc)", root.destroy)], vertical=True)
         for i in range(len(options)):
             root.bind(str(i + 1), lambda e, i=i: pick(i))
         root.bind("<Escape>", lambda e: root.destroy())
@@ -79,11 +110,13 @@ class TkPrompter:
         root = self._window(title, body, hint)
         poll_ms = max(1, int(poll_s * 1000))
 
-        if manual_ok:
-            def signal(_e):
-                result["value"] = True
-                root.destroy()
+        def signal(_e=None):
+            result["value"] = True
+            root.destroy()
 
+        buttons = [(f"{manual_ok} (Enter)", signal)] if manual_ok else []
+        self._buttons(root, buttons + [("중단 (Esc)", root.destroy)])
+        if manual_ok:
             root.bind("<Return>", signal)
             root.bind("<KP_Enter>", signal)
 

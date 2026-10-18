@@ -52,3 +52,50 @@ def test_telegram_channel_attaches_screenshot():
     page = Mock(); page.screenshot.return_value = b"png"
     Alerter(telegram=tg, sound=False, os_notify=False).alert(page, "제목", "본문")
     tg.send.assert_called_once_with("제목\n본문", b"png")
+
+
+def test_os_notification_works_inside_running_event_loop(monkeypatch):
+    """Playwright 동기 API는 메인 스레드에서 asyncio 루프를 돌린다: 그 안에서도 알림이 가야 한다."""
+    import asyncio
+    import desktop_notifier
+
+    sent = []
+
+    class FakeNotifier:
+        def __init__(self, app_name):
+            pass
+
+        async def send(self, title, message):
+            sent.append((title, message))
+
+    monkeypatch.setattr(desktop_notifier, "DesktopNotifier", FakeNotifier)
+
+    async def inside_loop():
+        Alerter._os_notification(None, "보안문자", "직접 입력")
+
+    # 테스트 세션의 Playwright 루프와 겹치지 않게 별도 스레드에서 "루프 안" 상황을 만든다.
+    import threading
+    t = threading.Thread(target=lambda: asyncio.run(inside_loop()))
+    t.start()
+    t.join(10)
+    assert sent == [("보안문자", "직접 입력")]
+
+
+def test_os_notification_loop_stays_open_for_callbacks(monkeypatch):
+    """Windows 알림 백엔드는 보낸 뒤에도 같은 루프로 콜백을 보낸다: 그 루프가 닫히면 안 된다."""
+    import asyncio
+    import desktop_notifier
+
+    loops = []
+
+    class FakeNotifier:
+        def __init__(self, app_name):
+            pass
+
+        async def send(self, title, message):
+            loops.append(asyncio.get_running_loop())
+
+    monkeypatch.setattr(desktop_notifier, "DesktopNotifier", FakeNotifier)
+    Alerter._os_notification(None, "a", "b")
+    Alerter._os_notification(None, "c", "d")
+    assert len(loops) == 2 and not loops[0].is_closed() and loops[0] is loops[1]

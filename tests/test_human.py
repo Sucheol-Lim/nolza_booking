@@ -1,4 +1,6 @@
+import pytest
 import json
+from unittest.mock import Mock
 
 from booking_assistant.human import FakePrompter
 from booking_assistant.runlog import RunLog
@@ -83,6 +85,7 @@ def test_tk_wait_until_survives_done_error(monkeypatch):
     from booking_assistant.human import TkPrompter
     root = _FakeRoot()
     monkeypatch.setattr(TkPrompter, "_window", lambda self, *a: root)
+    monkeypatch.setattr(TkPrompter, "_buttons", staticmethod(lambda *a, **k: None))
     calls = iter([RuntimeError("페이지 이동 중"), False, True])
 
     def done():
@@ -101,3 +104,88 @@ def test_fake_wait_until_manual_signal_only_when_offered():
     p2 = FakePrompter(manual_waits=[True])
     p2.WAIT_TOTAL_S = 0.05
     assert p2.wait_until("t", "b", lambda: False, poll_s=0.01) is False     # 제공 안 했으면 무시
+
+
+def test_runlog_screenshot_has_short_timeout(tmp_path):
+    """뒤쪽 탭 등에서 스크린샷이 멈춰도 진행이 30초씩 막히지 않게 짧게 기다린다."""
+    page = Mock()
+    page.url = "http://x/"
+    RunLog(tmp_path).event("captcha", "보안문자", page)
+    assert 0 < page.screenshot.call_args.kwargs["timeout"] <= 5000
+
+
+# --- 확인 창 버튼: 창이 키보드 포커스를 못 받아도(Windows 포그라운드 잠금) 클릭으로 처리 ---
+
+def _press_button_later(monkeypatch, label):
+    """창이 뜨면 label로 시작하는 버튼을 누른다. 화면이 없으면 건너뛴다."""
+    import tkinter
+    from booking_assistant.human import TkPrompter
+    orig = TkPrompter._window
+    seen = []
+
+    def patched(self, *a):
+        root = orig(self, *a)
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, tkinter.Button):
+                    seen.append(c.cget("text"))
+                yield c
+                yield from walk(c)
+
+        def press():
+            for w in walk(root):
+                if isinstance(w, tkinter.Button) and w.cget("text").startswith(label):
+                    w.invoke()
+                    return
+            root.destroy()     # 버튼이 없으면 창을 닫아 테스트가 멈추지 않게 한다
+
+        root.after(150, press)
+        return root
+
+    monkeypatch.setattr(TkPrompter, "_window", patched)
+    return seen
+
+
+@pytest.mark.parametrize("label,expected", [("승인", True), ("중단", False)])
+def test_tk_confirm_buttons(monkeypatch, label, expected):
+    from booking_assistant.human import TkPrompter
+    _press_button_later(monkeypatch, label)
+    assert TkPrompter().confirm("최종 제출 확인", "요약") is expected
+
+
+def test_tk_choose_buttons(monkeypatch):
+    from booking_assistant.human import TkPrompter
+    _press_button_later(monkeypatch, "2.")
+    assert TkPrompter().choose("대안", ["19:00", "21:00"]) == 1
+
+
+def test_tk_wait_until_passed_button_only_when_offered(monkeypatch):
+    from booking_assistant.human import TkPrompter
+    seen = _press_button_later(monkeypatch, "통과했어요")
+    assert TkPrompter().wait_until("보안문자", "b", lambda: False, manual_ok="통과했어요") is True
+    seen.clear()
+    _press_button_later(monkeypatch, "통과했어요")
+    assert TkPrompter().wait_until("보안문자", "b", lambda: False) is False   # 버튼 없음 → 닫힘
+    assert not any(s.startswith("통과했어요") for s in seen)
+
+
+def test_tk_window_retries_transient_tcl_error(monkeypatch):
+    """Windows에서 가끔 init.tcl을 못 읽어 Tk()가 실패한다: 재시도해서 창을 띄워야 한다."""
+    import tkinter
+    from booking_assistant import human
+
+    real_tk = tkinter.Tk
+    attempts = []
+
+    def flaky_tk(*a, **k):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise tkinter.TclError("Can't find a usable init.tcl")
+        return real_tk(*a, **k)
+
+    monkeypatch.setattr(tkinter, "Tk", flaky_tk)
+    monkeypatch.setattr(human, "TK_RETRY_DELAY_S", 0.01)
+    _press_button_later(monkeypatch, "승인")
+    assert human.TkPrompter().confirm("최종 제출 확인", "요약") is True
+    assert len(attempts) == 2
